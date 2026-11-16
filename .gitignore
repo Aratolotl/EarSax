@@ -1,0 +1,8 @@
+# Build output and caches (never committed, never mirrored)
+.build/
+build/
+.swiftpm/
+DerivedData/
+*.xcuserstate
+xcuserdata/
+.DS_Store
