@@ -24,10 +24,13 @@ EarSax does a few things and keeps them simple. One click sends everything to yo
 
 ## Install
 
-- **Download:** get the latest version from [Releases](https://github.com/Aratolotl/EarSax/releases). *No release has been published yet.*
+- **Download:** get the latest `.dmg` from [Releases](https://github.com/Aratolotl/EarSax/releases), open it, and drag EarSax into Applications.
 - **Homebrew:** coming once EarSax is notarized.
 
 Requires macOS 26 or later on a Mac with Apple silicon.
+
+> [!NOTE]
+> Current releases are previews and aren't signed by Apple yet, so macOS asks once before opening EarSax. Open it, click **Done** on the warning, then go to **System Settings → Privacy & Security**, scroll to the message about EarSax, and click **Open Anyway**. Each new preview asks for the System Audio Recording permission again.
 
 ## Getting started
 
