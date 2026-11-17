@@ -205,7 +205,7 @@ final class AppVolumeTap {
     /// keeps the app silenced) is untouched, so a switch costs one short gap instead of rebuilding the whole tap, which took
     /// 0.5 to 1 s per app and left the old speakers playing meanwhile.
     /// Returns Core Audio's status; on failure the caller rebuilds the tap instead.
-    func moveOutput(toDevice newOutputDevicePersistentID: String) -> OSStatus {
+    func moveOutput(toDevice newOutputDevicePersistentID: String, sampleRate newSampleRate: Float64) -> OSStatus {
         let speakersStatus = writeProperty(kAudioAggregateDevicePropertyFullSubDeviceList, of: privateDeviceID,
                                            value: [newOutputDevicePersistentID] as CFArray)
         guard speakersStatus == noErr else { return speakersStatus }
@@ -214,11 +214,19 @@ final class AppVolumeTap {
         outputDevicePersistentID = newOutputDevicePersistentID
         let mainStatus = writeProperty(kAudioAggregateDevicePropertyMainSubDevice, of: privateDeviceID,
                                        value: newOutputDevicePersistentID as CFString)
-        if mainStatus == noErr { useSmallAudioBuffer() }
-        return mainStatus
+        guard mainStatus == noErr else { return mainStatus }
+        // New speakers at another rate (Bluetooth earbuds at 44.1 kHz, desk speakers at 48 kHz): the private device follows
+        // them, and the tap's sound is resampled to it, as it already is for an app on a device of its own. Before, any rate
+        // difference rebuilt the tap, which left the old speakers playing for about a second (listening test, 2026-11-16).
+        if abs(sampleRate - newSampleRate) >= 1 {
+            let rateStatus = writeProperty(kAudioDevicePropertyNominalSampleRate, of: privateDeviceID, value: newSampleRate)
+            guard rateStatus == noErr else { return rateStatus }
+        }
+        useSmallAudioBuffer()
+        return noErr
     }
 
-    /// The rate the private device runs at; a quick move is only safe to a device running at the same rate.
+    /// The rate the private device runs at.
     var sampleRate: Float64 {
         readProperty(kAudioDevicePropertyNominalSampleRate, of: privateDeviceID, orDefault: Float64(0))
     }
@@ -378,26 +386,28 @@ final class TapController: @unchecked Sendable {
     /// Runs on the tap queue.
     private func moveTapIfNeeded(appID: String, toOutputDevice outputDevicePersistentID: String) {
         guard let active = tapsByApp[appID], active.tap.outputDevicePersistentID != outputDevicePersistentID else { return }
-        // A quick move only when the new output runs at the same sample rate and the old output still exists. Anything else
-        // (another rate, a device that just disappeared, a refused move) rebuilds the tap, which is tested for all of those
-        // (code review, findings 1 and 2).
+        // A quick move whenever the old output still exists, at any sample rate (the move sets the new rate). A device that
+        // just disappeared, or a refused move, rebuilds the tap (code review, findings 1 and 2).
         let previousOutputStillConnected = deviceID(forPersistentID: active.tap.outputDevicePersistentID) != kAudioObjectUnknown
         let newSampleRate = readProperty(kAudioDevicePropertyNominalSampleRate,
                                          of: deviceID(forPersistentID: outputDevicePersistentID), orDefault: Float64(0))
-        if previousOutputStillConnected, newSampleRate > 0, abs(active.tap.sampleRate - newSampleRate) < 1 {
+        if previousOutputStillConnected, newSampleRate > 0 {
+            let previousSampleRate = active.tap.sampleRate
             let startedAt = ContinuousClock.now
-            let status = active.tap.moveOutput(toDevice: outputDevicePersistentID)
+            let status = active.tap.moveOutput(toDevice: outputDevicePersistentID, sampleRate: newSampleRate)
             let elapsed = (ContinuousClock.now - startedAt).components
             let milliseconds = elapsed.seconds * 1000 + elapsed.attoseconds / 1_000_000_000_000_000
             if status == noErr {
-                earSaxLog.notice("Moved \(appID) to \(outputDevicePersistentID) in \(milliseconds) ms")
+                // The rates in the log let QA tell a cross-rate move from a same-rate one.
+                let rates = abs(previousSampleRate - newSampleRate) >= 1 ? ", \(Int(previousSampleRate)) to \(Int(newSampleRate)) Hz" : ""
+                earSaxLog.notice("Moved \(appID) to \(outputDevicePersistentID) in \(milliseconds) ms\(rates)")
                 return
             }
             earSaxLog.error("Moving \(appID) to \(outputDevicePersistentID) failed (\(readableStatus(status))); rebuilding its tap")
         }
         replaceTap(appID: appID, oldTap: active.tap, target: active.target, realtimeState: active.realtimeState,
                    outputDevicePersistentID: outputDevicePersistentID, reportProblem: active.reportProblem,
-                   reason: previousOutputStillConnected ? "moving it to a device at another sample rate" : "its device disconnected")
+                   reason: previousOutputStillConnected ? "the quick move didn't work" : "its device disconnected")
     }
 
     /// Called when EarSax quits, so apps go straight back to normal. Waits at most two seconds: if the queue is stuck on the
