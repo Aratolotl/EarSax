@@ -16,6 +16,15 @@ final class MixerModel {
     private(set) var canMuteOutputDevice = false
     /// macOS's alert volume, 0...1 (ruling R30), or nil until read or if it can't be.
     private(set) var alertVolume: Float?
+    /// Where macOS plays alert sounds (System Settings > Sound > "Play sound effects through"). EarSax never changes it
+    /// (ruling R32); the panel names it when it isn't the main output.
+    private(set) var alertDeviceID = AudioDeviceID(kAudioObjectUnknown)
+
+    /// The alert device's name, or nil when alerts play on the main output.
+    var alertDeviceNameIfElsewhere: String? {
+        guard alertDeviceID != kAudioObjectUnknown, alertDeviceID != currentOutputDeviceID else { return nil }
+        return outputDevices.first { $0.id == alertDeviceID }?.name
+    }
 
     // MARK: Input
 
@@ -188,6 +197,8 @@ final class MixerModel {
     /// Read each time the panel opens, so a change made in System Settings shows; never polled while it's closed.
     func refreshAlertVolume() {
         alertVolume = readAlertVolume()
+        alertDeviceID = readProperty(kAudioHardwarePropertyDefaultSystemOutputDevice, of: coreAudioSystem,
+                                     orDefault: AudioDeviceID(kAudioObjectUnknown))
     }
 
     func setAlertVolume(_ volume: Float) {
