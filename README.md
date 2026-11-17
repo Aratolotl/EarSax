@@ -55,6 +55,7 @@ Requires macOS 26 or later on a Mac with Apple silicon.
 - **Low delay:** EarSax adds about 12 ms (measured on Bluetooth headphones).
 - **Sound input:** with more than one microphone, pick which one the Mac uses from the row under the main volume.
 - **Known limit:** while EarSax changes an app's volume, AirPods may not hand off to an iPhone on their own. Set that app back to 100% to let them.
+- **Known limit:** when the Mac's output changes, some apps restart their own sound and pause for a moment (up to a few hundred milliseconds), as they do with macOS's own switch. EarSax's crossfade can't hide a pause inside the app.
 
 ### 🎙 Microphone
 - **Bluetooth headphones keep their full sound:** when they connect, macOS also hands them the microphone, which makes everything they play sound muffled while an app listens. EarSax switches back to the microphone you used before. You can still pick the headphones' microphone yourself, and the behavior can be turned off in Settings.
