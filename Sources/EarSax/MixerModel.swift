@@ -341,6 +341,18 @@ final class MixerModel {
     // MARK: Per-app output
 
     /// The Mac's current output: where every app plays unless it has a device of its own.
+    /// A switch EarSax asked for that macOS hasn't confirmed yet. macOS takes about a second to confirm; meanwhile any
+    /// refresh planned the taps for the old device and moved them back, then forward again: three moves per switch, heard
+    /// as scratching (listening test, 2026-11-16, 01:16:57 to 01:16:58 UTC).
+    @ObservationIgnored private var switchingTo: (device: AudioDeviceID, until: ContinuousClock.Instant)?
+
+    /// Where the taps of apps that follow the main output go: the device being switched to, while that switch is pending.
+    private var mainOutputForTaps: AudioDevice? {
+        if let switchingTo, ContinuousClock.now < switchingTo.until,
+           let target = outputDevices.first(where: { $0.id == switchingTo.device }) { return target }
+        return mainOutputDevice
+    }
+
     var mainOutputDevice: AudioDevice? {
         outputDevices.first { $0.id == currentOutputDeviceID }
     }
@@ -379,9 +391,8 @@ final class MixerModel {
         moveTapsToTheirOutputs()
     }
 
-    /// `mainOutput`: the main output to plan for, when it's about to change; the current one otherwise.
-    private func outputDevicePersistentID(for appID: String, mainOutput: OutputDevice? = nil) -> String? {
-        guard let mainOutput = mainOutput ?? mainOutputDevice else { return nil }
+    private func outputDevicePersistentID(for appID: String) -> String? {
+        guard let mainOutput = mainOutputForTaps else { return nil }
         return setting(for: appID).outputDevicePersistentID(mainOutput: mainOutput.persistentID,
                                                             connectedDevices: Set(outputDevices.map(\.persistentID)))
     }
@@ -399,9 +410,9 @@ final class MixerModel {
     }
 
     /// Keeps every tap playing where its app should. Covers tapped apps that aren't running: their taps wait for them.
-    private func moveTapsToTheirOutputs(mainOutput: OutputDevice? = nil) {
+    private func moveTapsToTheirOutputs() {
         for appID in tappedAppIDs {
-            guard let playsOnDevice = outputDevicePersistentID(for: appID, mainOutput: mainOutput) else { continue }
+            guard let playsOnDevice = outputDevicePersistentID(for: appID) else { continue }
             tapController.moveTap(appID: appID, toOutputDevice: playsOnDevice)
         }
     }
@@ -462,14 +473,19 @@ final class MixerModel {
         // The taps move first, then the Mac's output. The other way round, the apps already played toward the new device
         // while their taps still sent them to the old one, for the half second to a second it took macOS to report the switch
         // and EarSax to follow: the old device played again between two cuts (listening test, 2026-11-16).
-        moveTapsToTheirOutputs(mainOutput: device)
+        // ponytail: 3 s covers the second macOS takes; a switch that never lands falls back to the real output after it.
+        switchingTo = (device.id, .now + .seconds(3))
+        moveTapsToTheirOutputs()
         // ponytail: waits behind the tap queue; while the queue waits on the permission prompt, the switch waits too.
         tapController.afterQueuedWork { [weak self] in
             guard let self else { return }
             earSaxLog.notice("Taps moved; switching the Mac's output to \(device.name)")
             // A switch sends a change notification, which refreshes the panel. Picking the current device, or a switch macOS
             // refused, sends none, so the taps are put back where they belong here.
-            if device.id == currentOutputDeviceID || !makeSystemOutputDevice(device.id) { refreshApps() }
+            if device.id == currentOutputDeviceID || !makeSystemOutputDevice(device.id) {
+                switchingTo = nil
+                refreshApps()
+            }
         }
     }
 
@@ -498,6 +514,7 @@ final class MixerModel {
 
     private func outputDeviceChanged() {
         let changedAt = ContinuousClock.now
+        switchingTo = nil   // confirmed, or another switch (Control Center) won: either way macOS's answer counts now
         refreshOutputDevices()
         // Before anything slower (listing every app), so a switch made outside EarSax (Control Center, a device turning off)
         // leaves the old device as soon as possible. A switch picked in EarSax already moved them; then this does nothing.
