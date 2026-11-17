@@ -221,6 +221,14 @@ final class AppVolumeTap {
         if abs(sampleRate - newSampleRate) >= 1 {
             let rateStatus = writeProperty(kAudioDevicePropertyNominalSampleRate, of: privateDeviceID, value: newSampleRate)
             guard rateStatus == noErr else { return rateStatus }
+            // The write is only a request; Core Audio applies it a moment later. Wait for it, or the caller rebuilds the tap
+            // (code review of the cross-rate move, finding 1).
+            // ponytail: polls on the tap queue for at most 250 ms; a listener on the rate if that ever shows up as a delay.
+            let deadline = ContinuousClock.now + .milliseconds(250)
+            while abs(sampleRate - newSampleRate) >= 1 {
+                guard ContinuousClock.now < deadline else { return kAudioHardwareUnspecifiedError }
+                Thread.sleep(forTimeInterval: 0.005)
+            }
         }
         useSmallAudioBuffer()
         return noErr
@@ -388,6 +396,7 @@ final class TapController: @unchecked Sendable {
         guard let active = tapsByApp[appID], active.tap.outputDevicePersistentID != outputDevicePersistentID else { return }
         // A quick move whenever the old output still exists, at any sample rate (the move sets the new rate). A device that
         // just disappeared, or a refused move, rebuilds the tap (code review, findings 1 and 2).
+        let movedAt = ContinuousClock.now
         let previousOutputStillConnected = deviceID(forPersistentID: active.tap.outputDevicePersistentID) != kAudioObjectUnknown
         let newSampleRate = readProperty(kAudioDevicePropertyNominalSampleRate,
                                          of: deviceID(forPersistentID: outputDevicePersistentID), orDefault: Float64(0))
@@ -401,6 +410,10 @@ final class TapController: @unchecked Sendable {
                 // The rates in the log let QA tell a cross-rate move from a same-rate one.
                 let rates = abs(previousSampleRate - newSampleRate) >= 1 ? ", \(Int(previousSampleRate)) to \(Int(newSampleRate)) Hz" : ""
                 earSaxLog.notice("Moved \(appID) to \(outputDevicePersistentID) in \(milliseconds) ms\(rates)")
+                // Counts as built now, so a sample-rate notice from before the move doesn't rebuild it (code review of the
+                // cross-rate move, finding 5).
+                tapsByApp[appID] = ActiveTap(tap: active.tap, target: active.target, realtimeState: active.realtimeState,
+                                             reportProblem: active.reportProblem, builtAt: movedAt)
                 return
             }
             earSaxLog.error("Moving \(appID) to \(outputDevicePersistentID) failed (\(readableStatus(status))); rebuilding its tap")
