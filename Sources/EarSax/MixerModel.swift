@@ -203,6 +203,9 @@ final class MixerModel {
             guard let lastPlaying = lastPlayingTimeByApp[app.id] else { return false }
             return now - lastPlaying < Self.stillShownAfterStopping
         }
+        // Moves first, together, so a device that comes back (pinned apps) is one crossfade, not one per app (code review,
+        // finding 4). The call at the end covers taps this refresh creates.
+        moveTapsToTheirOutputs()
         for app in allApps { applySetting(to: app) }
         removeTapsOfAppsThatQuit(stillRunning: Set(allApps.map(\.id)))
         moveTapsToTheirOutputs()
