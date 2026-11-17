@@ -1,7 +1,7 @@
 import CoreAudio
 import Foundation
 
-/// Which output devices EarSax lists. Hiding only declutters the menus; it never moves sound.
+/// Which devices EarSax lists, outputs and inputs alike. Hiding only declutters the menus; it never moves sound.
 struct DeviceVisibility: Codable, Equatable {
     /// The user's own choices from Settings, by persistent ID. Devices without one use the default.
     var choiceByDevice: [String: Choice] = [:]
@@ -18,21 +18,53 @@ struct DeviceVisibility: Codable, Equatable {
         persistentID.hasPrefix("zoom.us.zoomaudiodevice") || persistentID.hasPrefix("MSLoopbackDriverDevice")
     }
 
-    func isShown(persistentID: String) -> Bool {
-        choiceByDevice[persistentID]?.isShown ?? !Self.isMeetingAppDevice(persistentID: persistentID)
+    /// One key per physical device. macOS lists a Bluetooth headset as two devices, "<address>:output" and
+    /// "<address>:input", so both halves share one choice (code review of the input picker, finding 1).
+    static func choiceKey(persistentID: String) -> String {
+        for suffix in [":output", ":input"] where persistentID.hasSuffix(suffix) { return String(persistentID.dropLast(suffix.count)) }
+        return persistentID
     }
 
-    /// "Play everything on": shown devices, plus the main output even when hidden, so the checkmark is never missing.
-    func listedForPlayEverythingOn(_ devices: [OutputDevice], mainOutput: AudioDeviceID) -> [OutputDevice] {
-        devices.filter { isShown(persistentID: $0.persistentID) || $0.id == mainOutput }
+    func isShown(persistentID: String) -> Bool {
+        // The raw ID is the fallback for a choice saved before keys were shared.
+        (choiceByDevice[Self.choiceKey(persistentID: persistentID)] ?? choiceByDevice[persistentID])?.isShown
+            ?? !Self.isMeetingAppDevice(persistentID: persistentID)
+    }
+
+    mutating func setShown(_ isShown: Bool, persistentID: String, name: String) {
+        choiceByDevice[persistentID] = nil
+        choiceByDevice[Self.choiceKey(persistentID: persistentID)] = Choice(isShown: isShown, name: name)
+    }
+
+    /// The panel's two dropdowns, "Play everything on" and "Sound input": shown devices, plus the one in use even when
+    /// hidden, so the checkmark is never missing.
+    func listedForMainMenu(_ devices: [AudioDevice], current: AudioDeviceID) -> [AudioDevice] {
+        devices.filter { isShown(persistentID: $0.persistentID) || $0.id == current }
     }
 
     /// One app's list: shown devices, plus its own pinned or chosen device even when hidden, so that choice can be undone.
-    func listedForApp(_ devices: [OutputDevice], setting: AppVolumeSetting) -> [OutputDevice] {
+    func listedForApp(_ devices: [AudioDevice], setting: AppVolumeSetting) -> [AudioDevice] {
         var ownDevices: Set<String> = []
         if let pinned = setting.alwaysOn?.persistentID { ownDevices.insert(pinned) }
         if case .device(let chosen) = setting.forNow { ownDevices.insert(chosen.persistentID) }
         return devices.filter { isShown(persistentID: $0.persistentID) || ownDevices.contains($0.persistentID) }
+    }
+
+    /// Settings' list: every connected device once (a headset is both an output and an input), then the hidden devices
+    /// that are away, so they can be shown again. One choice per device covers both dropdowns.
+    func settingsRows(outputs: [AudioDevice], inputs: [AudioDevice]) -> [SettingsDeviceRow] {
+        var listedKeys: Set<String> = []
+        let connected = (outputs + inputs)
+            .filter { listedKeys.insert(Self.choiceKey(persistentID: $0.persistentID)).inserted }
+            .map {
+                SettingsDeviceRow(persistentID: $0.persistentID, name: $0.name, symbolName: $0.symbolName, isConnected: true,
+                                  isShown: isShown(persistentID: $0.persistentID))
+            }
+        let hiddenAndAway = choiceByDevice
+            .filter { !$0.value.isShown && listedKeys.insert(Self.choiceKey(persistentID: $0.key)).inserted }
+            .map { SettingsDeviceRow(persistentID: $0.key, name: $0.value.name, symbolName: "powerplug", isConnected: false, isShown: false) }
+            .sorted { $0.name.lowercased() < $1.name.lowercased() }
+        return connected + hiddenAndAway
     }
 
     // MARK: Saving

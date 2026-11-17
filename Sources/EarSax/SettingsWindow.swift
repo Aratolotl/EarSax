@@ -32,6 +32,15 @@ struct SettingsView: View {
                     .foregroundStyle(.secondary)
             }
             Section {
+                Toggle("Keep using the Mac's microphone when Bluetooth headphones connect", isOn: $mixer.keepsMacMicrophoneWithBluetooth)
+            } header: {
+                Text("Microphone")
+            } footer: {
+                Text("When Bluetooth headphones connect, macOS also uses their microphone, which makes everything they play sound muffled while an app listens. EarSax switches back to the microphone you used before. You can still choose the headphones' microphone afterwards.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Section {
                 ForEach(mixer.devicesForSettings) { row in
                     Toggle(isOn: Binding(get: { row.isShown },
                                          set: { mixer.setShown($0, persistentID: row.persistentID, name: row.name) })) {
@@ -42,7 +51,7 @@ struct SettingsView: View {
             } header: {
                 Text("Show in EarSax's lists")
             } footer: {
-                Text("Hiding a device only removes it from EarSax's lists. Anything already playing there keeps playing.")
+                Text("Hiding a device only removes it from EarSax's lists, for sound output and input alike. Anything already using it keeps using it.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }

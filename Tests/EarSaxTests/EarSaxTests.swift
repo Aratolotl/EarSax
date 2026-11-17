@@ -160,8 +160,8 @@ private let everything: Set<String> = ["laptop", "display", "speaker"]
 
 // MARK: - Hidden devices (Settings)
 
-private func outputDevice(_ id: AudioDeviceID, _ persistentID: String) -> OutputDevice {
-    OutputDevice(id: id, persistentID: persistentID, name: persistentID, symbolName: "hifispeaker.fill")
+private func outputDevice(_ id: AudioDeviceID, _ persistentID: String) -> AudioDevice {
+    AudioDevice(id: id, persistentID: persistentID, name: persistentID, symbolName: "hifispeaker.fill")
 }
 
 @Test func hidingOnlyDecluttersTheLists() {
@@ -169,16 +169,48 @@ private func outputDevice(_ id: AudioDeviceID, _ persistentID: String) -> Output
     let devices = [outputDevice(1, "speaker"), outputDevice(2, "zoom.us.zoomaudiodevice.001"),
                    outputDevice(3, "MSLoopbackDriverDevice_UID"), outputDevice(4, "BlackHole2ch_UID"), outputDevice(5, "display")]
     var visibility = DeviceVisibility()
-    #expect(visibility.listedForPlayEverythingOn(devices, mainOutput: 1).map(\.persistentID) == ["speaker", "BlackHole2ch_UID", "display"])
+    #expect(visibility.listedForMainMenu(devices, current: 1).map(\.persistentID) == ["speaker", "BlackHole2ch_UID", "display"])
 
     visibility.choiceByDevice["display"] = .init(isShown: false, name: "Studio Display")
     visibility.choiceByDevice["zoom.us.zoomaudiodevice.001"] = .init(isShown: true, name: "ZoomAudioDevice")   // the user wins
-    #expect(visibility.listedForPlayEverythingOn(devices, mainOutput: 1).map(\.persistentID) == ["speaker", "zoom.us.zoomaudiodevice.001", "BlackHole2ch_UID"])
-    #expect(visibility.listedForPlayEverythingOn(devices, mainOutput: 5).map(\.persistentID).contains("display"))   // hidden but in use
+    #expect(visibility.listedForMainMenu(devices, current: 1).map(\.persistentID) == ["speaker", "zoom.us.zoomaudiodevice.001", "BlackHole2ch_UID"])
+    #expect(visibility.listedForMainMenu(devices, current: 5).map(\.persistentID).contains("display"))   // hidden but in use
 
     let pinnedToDisplay = AppVolumeSetting(alwaysOn: SavedDevice(persistentID: "display", name: "Studio Display"))
     #expect(visibility.listedForApp(devices, setting: pinnedToDisplay).map(\.persistentID).contains("display"))
     #expect(!visibility.listedForApp(devices, setting: .untouched).map(\.persistentID).contains("display"))
+}
+
+@Test func settingsListEachDeviceOnceForOutputAndInput() {
+    // A headset is both an output and an input: one row, one choice for both dropdowns.
+    let headset = outputDevice(1, "headset")
+    let microphone = AudioDevice(id: 2, persistentID: "usb-mic", name: "usb-mic", symbolName: "mic")
+    var visibility = DeviceVisibility()
+    visibility.choiceByDevice["away"] = .init(isShown: false, name: "Away Speaker")
+    visibility.choiceByDevice["headset"] = .init(isShown: false, name: "headset")
+    let rows = visibility.settingsRows(outputs: [headset], inputs: [headset, microphone])
+    #expect(rows.map(\.persistentID) == ["headset", "usb-mic", "away"])
+    #expect(rows.map(\.isConnected) == [true, true, false])
+    #expect(visibility.listedForMainMenu([headset, microphone], current: 2).map(\.persistentID) == ["usb-mic"])   // hidden in the input menu too
+}
+
+@Test func aBluetoothHeadsetsTwoHalvesShareOneChoice() {
+    // macOS lists a Bluetooth headset as "<address>:output" and "<address>:input".
+    let earbudsOut = outputDevice(1, "AA-BB:output")
+    let earbudsIn = AudioDevice(id: 2, persistentID: "AA-BB:input", name: "AA-BB:input", symbolName: "headphones")
+    var visibility = DeviceVisibility()
+    visibility.setShown(false, persistentID: "AA-BB:output", name: "Earbuds")
+    #expect(visibility.settingsRows(outputs: [earbudsOut], inputs: [earbudsIn]).map(\.persistentID) == ["AA-BB:output"])
+    #expect(visibility.listedForMainMenu([earbudsIn], current: 9).isEmpty)   // hidden from the input menu too
+
+    // A choice saved before keys were shared still counts, and the next change replaces it.
+    var older = DeviceVisibility()
+    older.choiceByDevice["AA-BB:output"] = .init(isShown: false, name: "Earbuds")
+    #expect(!older.isShown(persistentID: "AA-BB:output"))
+    #expect(older.settingsRows(outputs: [], inputs: []).count == 1)
+    older.setShown(true, persistentID: "AA-BB:output", name: "Earbuds")
+    #expect(older.choiceByDevice.keys.sorted() == ["AA-BB"])
+    #expect(older.isShown(persistentID: "AA-BB:input"))
 }
 
 @Test func hiddenDeviceChoicesSurviveSaveAndReload() throws {
@@ -293,9 +325,29 @@ private func runOneAudioCycle(_ copier: TapAudioCopier, frameCount: Int) -> [Flo
     #expect(outputSymbolName(transportType: kAudioDeviceTransportTypeBuiltIn, terminalType: 769, dataSource: 0x6973_706B) == "laptopcomputer")   // 'ispk'
     #expect(outputSymbolName(transportType: kAudioDeviceTransportTypeBuiltIn, terminalType: 0, dataSource: 0x6864_706E) == "headphones")        // 'hdpn'
     #expect(outputSymbolName(transportType: kAudioDeviceTransportTypeDisplayPort, terminalType: 0, dataSource: 0) == "display")
+    #expect(inputSymbolName(transportType: kAudioDeviceTransportTypeBuiltIn) == "laptopcomputer")
+    #expect(inputSymbolName(transportType: kAudioDeviceTransportTypeUSB) == "mic")
+    #expect(inputSymbolName(transportType: kAudioDeviceTransportTypeVirtual) == "waveform")
 }
 
 @Test func earSaxOwnPrivateDevicesAreNotOfferedAsOutputs() {
     #expect(isEarSaxPrivateDevice(persistentID: earSaxPrivateDevicePrefix + UUID().uuidString))
     #expect(!isEarSaxPrivateDevice(persistentID: "BuiltInSpeakerDevice"))
+}
+
+// MARK: - Keeping the Mac's microphone (R26 to R28)
+
+@Test func bluetoothHeadphonesDontKeepTheMicrophoneTheyTookOnConnecting() {
+    let builtIn = AudioDevice(id: 1, persistentID: "BuiltInMicrophoneDevice", name: "Built-in", symbolName: "laptopcomputer", isBuiltIn: true)
+    let usb = AudioDevice(id: 2, persistentID: "usb-mic", name: "USB", symbolName: "mic")
+    let earbuds = AudioDevice(id: 3, persistentID: "AA-BB:input", name: "Earbuds", symbolName: "headphones", isBluetooth: true)
+    let all = [builtIn, usb, earbuds]
+    // Back to the one used before; if it's gone, the built-in microphone.
+    #expect(microphoneToKeep(lastNonBluetoothInput: "usb-mic", current: earbuds, justConnected: true, inputs: all) == usb)
+    #expect(microphoneToKeep(lastNonBluetoothInput: "usb-mic", current: earbuds, justConnected: true, inputs: [builtIn, earbuds]) == builtIn)
+    #expect(microphoneToKeep(lastNonBluetoothInput: nil, current: earbuds, justConnected: true, inputs: all) == builtIn)
+    // Left alone: the user's own later pick, a non-Bluetooth input, or headphones that are the only microphone.
+    #expect(microphoneToKeep(lastNonBluetoothInput: "usb-mic", current: earbuds, justConnected: false, inputs: all) == nil)
+    #expect(microphoneToKeep(lastNonBluetoothInput: "BuiltInMicrophoneDevice", current: usb, justConnected: true, inputs: all) == nil)
+    #expect(microphoneToKeep(lastNonBluetoothInput: nil, current: earbuds, justConnected: true, inputs: [earbuds]) == nil)
 }

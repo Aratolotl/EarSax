@@ -11,6 +11,7 @@ struct MixerPanel: View {
         VStack(alignment: .leading, spacing: 12) {
             PermissionNote(mixer: mixer)
             OutputSection(mixer: mixer)
+            InputRow(mixer: mixer)
             Divider()
             AppsSection(mixer: mixer)
             Divider()
@@ -125,6 +126,36 @@ private struct OutputSection: View {
             } else {
                 Text("Volume is set on the device").font(.caption).foregroundStyle(.secondary)
             }
+        }
+    }
+}
+
+// MARK: - Input
+
+/// The Mac's sound input, a dropdown like the output's. Picker only, no level slider (ruling R24). Shown only with two or
+/// more microphones (R27): it's there to see and override what EarSax chose when Bluetooth headphones connect.
+private struct InputRow: View {
+    let mixer: MixerModel
+
+    var body: some View {
+        if mixer.devicesForSoundInput.count >= 2 {
+            Menu {
+                Section("Sound input") {
+                    ForEach(mixer.devicesForSoundInput) { device in
+                        Toggle(isOn: Binding(get: { device.id == mixer.currentInputDeviceID },
+                                             set: { _ in mixer.selectInputDevice(device) })) {
+                            Label(device.name, systemImage: device.symbolName)
+                        }
+                    }
+                }
+            } label: {
+                // Always the microphone icon, so the row reads as the input even when the device is a headset.
+                Label(mixer.mainInputDevice?.name ?? "No input device", systemImage: mixer.mainInputDevice == nil ? "mic.slash" : "mic")
+            }
+            .menuStyle(.borderlessButton)
+            .fixedSize()
+            .accessibilityLabel("Input device")
+            .accessibilityValue(mixer.mainInputDevice?.name ?? "None")
         }
     }
 }
