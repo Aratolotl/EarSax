@@ -60,6 +60,9 @@ final class TapAudioCopier: Sendable {
     private let audioCycleCount = Atomic<Int>(0)
     private let lastSoundAtNanoseconds = Atomic<UInt64>(0)
     private let heardSound = Atomic<Bool>(false)
+    /// Listening-test aid: when the current stretch of silence began (0 = sound now), and the longest stretch so far.
+    private let silenceStartedAtNanoseconds = Atomic<UInt64>(0)
+    private let longestSilenceNanoseconds = Atomic<UInt64>(0)
 
     init(volume: RealtimeVolumeState, fadedIn: Bool = true) {
         self.volume = volume
@@ -83,6 +86,11 @@ final class TapAudioCopier: Sendable {
     func jumpFade(to target: Float) {
         startFade(to: target, overFrames: 1)
         fadeProgress.store(target.bitPattern, ordering: .relaxed)
+    }
+
+    /// The longest silence in the captured sound since the last call, in ms (silence before the first sound doesn't count).
+    func takeLongestSilenceMilliseconds() -> Int {
+        Int(longestSilenceNanoseconds.exchange(0, ordering: .relaxed) / 1_000_000)
     }
 
     var hasRunAudioCycle: Bool { audioCycleCount.load(ordering: .relaxed) > 0 }
@@ -143,9 +151,18 @@ final class TapAudioCopier: Sendable {
         }
         appliedVolumeMultiplier.store(targetMultiplier.bitPattern, ordering: .relaxed)
         fadeProgress.store(fadeAtEnd.bitPattern, ordering: .relaxed)
+        let now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
+        let silenceStartedAt = silenceStartedAtNanoseconds.load(ordering: .relaxed)
         if cycleHadSound {
             heardSound.store(true, ordering: .relaxed)
-            lastSoundAtNanoseconds.store(clock_gettime_nsec_np(CLOCK_UPTIME_RAW), ordering: .relaxed)
+            lastSoundAtNanoseconds.store(now, ordering: .relaxed)
+            if silenceStartedAt > 0 {
+                let silence = now - silenceStartedAt
+                if silence > longestSilenceNanoseconds.load(ordering: .relaxed) { longestSilenceNanoseconds.store(silence, ordering: .relaxed) }
+                silenceStartedAtNanoseconds.store(0, ordering: .relaxed)
+            }
+        } else if silenceStartedAt == 0, heardSound.load(ordering: .relaxed) {
+            silenceStartedAtNanoseconds.store(now, ordering: .relaxed)
         }
     }
 
@@ -434,6 +451,7 @@ final class AppVolumeTap {
     /// The app played something here just now.
     func isPlaying(within window: Duration) -> Bool { speakers?.copier.heardSound(within: window) ?? false }
     var hasFadedOut: Bool { speakers?.copier.hasFadedOut ?? true }
+    func takeLongestSilenceMilliseconds() -> Int { speakers?.copier.takeLongestSilenceMilliseconds() ?? 0 }
 
     func fadeIn(over duration: Duration) {
         guard let speakers else { return }
@@ -638,11 +656,15 @@ final class TapController: @unchecked Sendable {
         }
         guard !crossfading.isEmpty else { return }
 
-        // Wait for each new device to run, at most a second, then let it warm up.
-        let deadline = ContinuousClock.now + .seconds(1)
-        while ContinuousClock.now < deadline, !crossfading.allSatisfy({ $0.incoming.isRunning }) {
+        // Wait until each new tap has sound (running isn't enough: a new tap can run for a moment before the app's sound
+        // reaches it, which sent a crossfade to the fallback, a cut; listening test, 2026-11-17 02:41:47), at most 1.5 s.
+        // An app that went quiet meanwhile doesn't hold the others up.
+        let deadline = ContinuousClock.now + .milliseconds(1500)
+        while ContinuousClock.now < deadline,
+              !crossfading.allSatisfy({ $0.incoming.hasHeardSound || !$0.active.tap.isPlaying(within: Self.recentSound) }) {
             Thread.sleep(forTimeInterval: 0.005)
         }
+        let newTapsReadyAfter = milliseconds(since: movedAt)
         let anyBluetooth = crossfading.contains { isBluetoothDevice($0.incoming.outputDevicePersistentID) }
         Thread.sleep(forTimeInterval: seconds(anyBluetooth ? Self.bluetoothWarmUp : Self.wiredWarmUp))
 
@@ -680,7 +702,7 @@ final class TapController: @unchecked Sendable {
             // of the cross-rate move, finding 5).
             tapsByApp[item.appID] = ActiveTap(tap: item.incoming, target: item.active.target, realtimeState: item.active.realtimeState,
                                               reportProblem: item.active.reportProblem, builtAt: movedAt)
-            earSaxLog.notice("Crossfaded \(item.appID) to \(item.incoming.outputDevicePersistentID) in \(milliseconds(since: movedAt)) ms (old device kept \(Int(item.fadeOutDelay * 1000)) ms longer)")
+            earSaxLog.notice("Crossfaded \(item.appID) to \(item.incoming.outputDevicePersistentID) in \(milliseconds(since: movedAt)) ms (new tap had sound after \(newTapsReadyAfter) ms; old device kept \(Int(item.fadeOutDelay * 1000)) ms longer)")
         }
         // Safety net: an app that played before the switch must still play on the new tap once the old one is gone. If it
         // doesn't, its tap is rebuilt, rather than leaving the app silent (listening test, 2026-11-17).
@@ -691,6 +713,20 @@ final class TapController: @unchecked Sendable {
             replaceTap(appID: item.appID, oldTap: item.incoming, target: active.target, realtimeState: active.realtimeState,
                        outputDevicePersistentID: item.incoming.outputDevicePersistentID, reportProblem: active.reportProblem,
                        reason: "it went silent after the crossfade")
+        }
+    }
+
+    /// Listening-test aid: the first call (at a pick) resets; the next (after macOS switched) logs each tap's longest silence
+    /// in the app's own captured sound. A long one means the app itself paused while macOS moved it, which no crossfade can
+    /// hide.
+    func logLongestSilences(after description: String?) {
+        tapQueue.async { [self] in
+            for (appID, active) in tapsByApp.sorted(by: { $0.key < $1.key }) {
+                let longest = active.tap.takeLongestSilenceMilliseconds()
+                if let description, active.tap.isPlaying(within: .milliseconds(300)) {
+                    earSaxLog.notice("Longest silence in \(appID)'s own sound \(description): \(longest) ms")
+                }
+            }
         }
     }
 

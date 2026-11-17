@@ -377,7 +377,8 @@ final class MixerModel {
     /// as scratching (listening test, 2026-11-16, 01:16:57 to 01:16:58 UTC).
     /// `until` is nil while the taps are still moving; the 8 s count starts once the switch is sent (code review of the
     /// switch order, finding 1).
-    @ObservationIgnored private var switchingTo: (device: AudioDeviceID, until: ContinuousClock.Instant?)?
+    /// Observed: the panel shows the picked device at once, not 1 to 2 s later when macOS confirms after the crossfades.
+    private var switchingTo: (device: AudioDeviceID, until: ContinuousClock.Instant?)?
     private static let switchConfirmationWait: Duration = .seconds(8)
 
     /// Where the taps of apps that follow the main output go: the device being switched to, while that switch is pending.
@@ -386,6 +387,9 @@ final class MixerModel {
            let target = outputDevices.first(where: { $0.id == switchingTo.device }) { return target }
         return mainOutputDevice
     }
+
+    /// What the panel shows as the main output: the pick while its switch is on its way.
+    var shownOutputDevice: AudioDevice? { mainOutputForTaps }
 
     var mainOutputDevice: AudioDevice? {
         outputDevices.first { $0.id == currentOutputDeviceID }
@@ -512,6 +516,7 @@ final class MixerModel {
         // The default volume before any app plays there, not a second later when macOS confirms (finding 2).
         if !alreadyThere { capVolume(of: device.id) }
         switchingTo = (device.id, nil)
+        tapController.logLongestSilences(after: nil)   // starts the count for the listening-test line after the switch
         moveTapsToTheirOutputs()
         // ponytail: waits behind the tap queue; while the queue waits on the permission prompt, the switch waits too.
         tapController.afterQueuedWork { [weak self] in
@@ -565,7 +570,14 @@ final class MixerModel {
         refreshOutputDevices()
         // Only the device EarSax asked for ends the wait. An earlier switch landing late doesn't, and a switch made elsewhere
         // (Control Center) meanwhile takes over when the wait runs out (finding 4).
-        if currentOutputDeviceID == switchingTo?.device { switchingTo = nil }
+        if currentOutputDeviceID == switchingTo?.device {
+            switchingTo = nil
+            let name = mainOutputDevice?.name ?? "the new output"
+            Task { [weak self] in
+                try? await Task.sleep(for: .seconds(1.5))
+                self?.tapController.logLongestSilences(after: "during the switch to \(name)")
+            }
+        }
         // Before anything slower (listing every app), so a switch made outside EarSax (Control Center, a device turning off)
         // leaves the old device as soon as possible. A switch picked in EarSax already moved them; then this does nothing.
         moveTapsToTheirOutputs()
