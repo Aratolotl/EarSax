@@ -58,6 +58,18 @@ private let safari = AppIdentity(bundleID: "com.apple.Safari", name: "Safari", b
     #expect(target == .processes([7]))
 }
 
+@Test func appWithoutBundleIDIsTappedByProcess() {
+    // A game with no bundle ID is keyed by its bundle path; an empty bundle ID must never become a bundle-ID tap.
+    let target = chooseTapTarget(appBundleID: "/Games/Game.app", processes: [process(9, "")])
+    #expect(target == .processes([9]))
+}
+
+@Test func buriedExecutableFindsItsAppBundle() {
+    let executable = URL(fileURLWithPath: "/Games/Game.app/Contents/MacOS/lib/darwin-x86_64/Game")
+    #expect(enclosingAppBundle(of: executable)?.path == "/Games/Game.app")
+    #expect(enclosingAppBundle(of: URL(fileURLWithPath: "/usr/bin/say")) == nil)
+}
+
 // MARK: - The tap rule and the volume curve
 
 @Test func onlyChangedAppsNeedATap() {
