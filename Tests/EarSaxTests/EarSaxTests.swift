@@ -334,3 +334,20 @@ private func runOneAudioCycle(_ copier: TapAudioCopier, frameCount: Int) -> [Flo
     #expect(isEarSaxPrivateDevice(persistentID: earSaxPrivateDevicePrefix + UUID().uuidString))
     #expect(!isEarSaxPrivateDevice(persistentID: "BuiltInSpeakerDevice"))
 }
+
+// MARK: - Keeping the Mac's microphone (R26 to R28)
+
+@Test func bluetoothHeadphonesDontKeepTheMicrophoneTheyTookOnConnecting() {
+    let builtIn = AudioDevice(id: 1, persistentID: "BuiltInMicrophoneDevice", name: "Built-in", symbolName: "laptopcomputer", isBuiltIn: true)
+    let usb = AudioDevice(id: 2, persistentID: "usb-mic", name: "USB", symbolName: "mic")
+    let earbuds = AudioDevice(id: 3, persistentID: "AA-BB:input", name: "Earbuds", symbolName: "headphones", isBluetooth: true)
+    let all = [builtIn, usb, earbuds]
+    // Back to the one used before; if it's gone, the built-in microphone.
+    #expect(microphoneToKeep(previous: usb, current: earbuds, justConnected: true, inputs: all) == usb)
+    #expect(microphoneToKeep(previous: usb, current: earbuds, justConnected: true, inputs: [builtIn, earbuds]) == builtIn)
+    #expect(microphoneToKeep(previous: nil, current: earbuds, justConnected: true, inputs: all) == builtIn)
+    // Left alone: the user's own later pick, a non-Bluetooth input, or headphones that are the only microphone.
+    #expect(microphoneToKeep(previous: usb, current: earbuds, justConnected: false, inputs: all) == nil)
+    #expect(microphoneToKeep(previous: builtIn, current: usb, justConnected: true, inputs: all) == nil)
+    #expect(microphoneToKeep(previous: nil, current: earbuds, justConnected: true, inputs: [earbuds]) == nil)
+}

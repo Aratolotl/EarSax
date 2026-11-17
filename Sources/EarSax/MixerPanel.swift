@@ -132,13 +132,13 @@ private struct OutputSection: View {
 
 // MARK: - Input
 
-/// The Mac's sound input, a dropdown like the output's. Picker only, no level slider (ruling R24). Hidden on a Mac with
-/// no input device.
+/// The Mac's sound input, a dropdown like the output's. Picker only, no level slider (ruling R24). Shown only with two or
+/// more microphones (R27): it's there to see and override what EarSax chose when Bluetooth headphones connect.
 private struct InputRow: View {
     let mixer: MixerModel
 
     var body: some View {
-        if !mixer.inputDevices.isEmpty {
+        if mixer.inputDevices.count >= 2 {
             Menu {
                 Section("Sound input") {
                     ForEach(mixer.devicesForSoundInput) { device in

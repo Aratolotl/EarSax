@@ -12,6 +12,22 @@ struct AudioDevice: Identifiable, Hashable {
     let symbolName: String
     /// Bluetooth adds a long output delay (about 160 ms on Bluetooth earbuds), which matters for video on an app sent there.
     var isBluetooth = false
+    /// The Mac's own speakers or microphone: the input to fall back on when Bluetooth headphones take the microphone.
+    var isBuiltIn = false
+}
+
+/// The microphone to switch back to when Bluetooth headphones connect and macOS makes their microphone the Mac's input:
+/// that switch drops the headphones to hands-free sound, muffled at 16 kHz, for everything they play (rulings R26, R28).
+/// Returns nil to leave the input alone.
+/// - `previous`: the input in use just before; `current`: the input now.
+/// - `justConnected`: true when `current` connected a moment ago, so this is macOS's automatic switch, not the user's pick.
+func microphoneToKeep(previous: AudioDevice?, current: AudioDevice?, justConnected: Bool,
+                      inputs: [AudioDevice]) -> AudioDevice? {
+    guard let current, current.isBluetooth, justConnected else { return nil }
+    if let previous, !previous.isBluetooth, let stillThere = inputs.first(where: { $0.persistentID == previous.persistentID }) {
+        return stillThere
+    }
+    return inputs.first(where: \.isBuiltIn)   // nil when the headphones are the only microphone: they stay
 }
 
 func listOutputDevices() -> [AudioDevice] {
@@ -46,7 +62,8 @@ private func listDevices(scope: AudioObjectPropertyScope,
                            persistentID: persistentID,
                            name: readTextProperty(kAudioObjectPropertyName, of: deviceID) ?? "Unnamed device",
                            symbolName: symbolName(deviceID, streams[0], transportType),
-                           isBluetooth: transportType == kAudioDeviceTransportTypeBluetooth || transportType == kAudioDeviceTransportTypeBluetoothLE)
+                           isBluetooth: transportType == kAudioDeviceTransportTypeBluetooth || transportType == kAudioDeviceTransportTypeBluetoothLE,
+                           isBuiltIn: transportType == kAudioDeviceTransportTypeBuiltIn)
     }
 }
 

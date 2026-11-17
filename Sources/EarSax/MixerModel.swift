@@ -25,6 +25,17 @@ final class MixerModel {
         inputDevices.first { $0.id == currentInputDeviceID }
     }
 
+    /// Keep using the Mac's microphone when Bluetooth headphones connect (R26 to R28, on out of the box).
+    var keepsMacMicrophoneWithBluetooth: Bool {
+        didSet { preferences.set(keepsMacMicrophoneWithBluetooth, forKey: "keepsMacMicrophoneWithBluetooth") }
+    }
+    /// When each Bluetooth input appeared. Only the switch macOS makes in the first seconds after a connection is undone;
+    /// picking the headphones later is the user's choice.
+    @ObservationIgnored private var bluetoothInputConnectedAt: [String: ContinuousClock.Instant] = [:]
+    private static let automaticSwitchWindow: Duration = .seconds(5)
+    /// False until the first listing, so devices already connected at launch don't count as just connected.
+    @ObservationIgnored private var hasListedInputs = false
+
     // MARK: Apps
 
     /// Apps shown in the panel: only those playing now, plus a 5-second grace so a row doesn't flicker between songs.
@@ -80,6 +91,7 @@ final class MixerModel {
         limitsVolumeOnOutputChange = preferences.object(forKey: "limitsVolumeOnOutputChange") as? Bool ?? true
         let savedLimit = preferences.object(forKey: "outputChangeVolumeLimit") as? Double ?? 0.75
         outputChangeVolumeLimit = savedLimit.isFinite ? min(max(savedLimit, 0.05), 1) : 0.75   // damaged: back to 75% (finding 4)
+        keepsMacMicrophoneWithBluetooth = preferences.object(forKey: "keepsMacMicrophoneWithBluetooth") as? Bool ?? true
     }
 
     /// Reads the current state and starts listening for changes. Call once at launch.
@@ -124,9 +136,28 @@ final class MixerModel {
         }
     }
 
+    /// Works in either order of macOS's two notices (devices changed, input changed): each refresh compares with the last.
     func refreshInputDevices() {
+        let previousInput = mainInputDevice
+        let knownBefore = Set(inputDevices.map(\.persistentID))
         inputDevices = listInputDevices()
         currentInputDeviceID = systemInputDeviceID()
+        let now = ContinuousClock.now
+        if hasListedInputs {
+            for device in inputDevices where device.isBluetooth && !knownBefore.contains(device.persistentID) {
+                bluetoothInputConnectedAt[device.persistentID] = now
+            }
+        }
+        hasListedInputs = true
+        bluetoothInputConnectedAt = bluetoothInputConnectedAt.filter { now - $0.value < Self.automaticSwitchWindow }
+
+        guard keepsMacMicrophoneWithBluetooth, let current = mainInputDevice,
+              let keep = microphoneToKeep(previous: previousInput, current: current,
+                                          justConnected: bluetoothInputConnectedAt[current.persistentID] != nil,
+                                          inputs: inputDevices) else { return }
+        bluetoothInputConnectedAt[current.persistentID] = nil   // once: the user can still pick the headphones after
+        earSaxLog.notice("\(current.name) took the microphone as it connected; switching back to \(keep.name) so it keeps full sound quality")
+        if makeSystemInputDevice(keep.id) { currentInputDeviceID = keep.id }
     }
 
     func refreshOutputVolume() {
@@ -425,6 +456,7 @@ final class MixerModel {
     /// notification, so the list is re-read to keep the checkmark honest.
     func selectInputDevice(_ device: AudioDevice) {
         earSaxLog.notice("Picked \(device.name) under Sound input")
+        bluetoothInputConnectedAt[device.persistentID] = nil   // the user's pick is never undone
         if !makeSystemInputDevice(device.id) { refreshInputDevices() }
     }
 
