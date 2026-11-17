@@ -95,21 +95,21 @@ private struct OutputSection: View {
                 Section("Play everything on") {
                     ForEach(mixer.devicesForPlayEverythingOn) { device in
                         // A toggle, so the current device shows a checkmark; picking it again still clears per-app outputs.
-                        Toggle(isOn: Binding(get: { device.id == mixer.currentOutputDeviceID },
+                        Toggle(isOn: Binding(get: { device.id == mixer.shownOutputDevice?.id },
                                              set: { _ in mixer.selectOutputDevice(device) })) {
                             Label(device.name, systemImage: device.symbolName)
                         }
                     }
                 }
             } label: {
-                Label(mixer.mainOutputDevice?.name ?? "No output device",
-                      systemImage: mixer.mainOutputDevice?.symbolName ?? "speaker.slash")
+                Label(mixer.shownOutputDevice?.name ?? "No output device",
+                      systemImage: mixer.shownOutputDevice?.symbolName ?? "speaker.slash")
                     .fontWeight(.semibold)
             }
             .menuStyle(.borderlessButton)
             .fixedSize()
             .accessibilityLabel("Output device")
-            .accessibilityValue(mixer.mainOutputDevice?.name ?? "None")
+            .accessibilityValue(mixer.shownOutputDevice?.name ?? "None")
             if let volume = mixer.outputVolume {
                 HStack(spacing: 8) {
                     if mixer.canMuteOutputDevice {
