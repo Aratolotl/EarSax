@@ -194,6 +194,25 @@ private func outputDevice(_ id: AudioDeviceID, _ persistentID: String) -> AudioD
     #expect(visibility.listedForMainMenu([headset, microphone], current: 2).map(\.persistentID) == ["usb-mic"])   // hidden in the input menu too
 }
 
+@Test func aBluetoothHeadsetsTwoHalvesShareOneChoice() {
+    // macOS lists a Bluetooth headset as "<address>:output" and "<address>:input".
+    let earbudsOut = outputDevice(1, "AA-BB:output")
+    let earbudsIn = AudioDevice(id: 2, persistentID: "AA-BB:input", name: "AA-BB:input", symbolName: "headphones")
+    var visibility = DeviceVisibility()
+    visibility.setShown(false, persistentID: "AA-BB:output", name: "Earbuds")
+    #expect(visibility.settingsRows(outputs: [earbudsOut], inputs: [earbudsIn]).map(\.persistentID) == ["AA-BB:output"])
+    #expect(visibility.listedForMainMenu([earbudsIn], current: 9).isEmpty)   // hidden from the input menu too
+
+    // A choice saved before keys were shared still counts, and the next change replaces it.
+    var older = DeviceVisibility()
+    older.choiceByDevice["AA-BB:output"] = .init(isShown: false, name: "Earbuds")
+    #expect(!older.isShown(persistentID: "AA-BB:output"))
+    #expect(older.settingsRows(outputs: [], inputs: []).count == 1)
+    older.setShown(true, persistentID: "AA-BB:output", name: "Earbuds")
+    #expect(older.choiceByDevice.keys.sorted() == ["AA-BB"])
+    #expect(older.isShown(persistentID: "AA-BB:input"))
+}
+
 @Test func hiddenDeviceChoicesSurviveSaveAndReload() throws {
     let preferences = try #require(UserDefaults(suiteName: "EarSaxTests-\(UUID().uuidString)"))
     var visibility = DeviceVisibility()

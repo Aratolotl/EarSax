@@ -23,8 +23,12 @@ func listOutputDevices() -> [AudioDevice] {
     }
 }
 
+/// Only inputs macOS accepts as the Mac's input: Zoom's and Teams' virtual devices have input streams but can't be it
+/// (code review of the input picker, finding 2). Outputs don't get this check, since an app can still be sent to those.
 func listInputDevices() -> [AudioDevice] {
     listDevices(scope: kAudioObjectPropertyScopeInput) { _, _, transportType in inputSymbolName(transportType: transportType) }
+        .filter { readProperty(kAudioDevicePropertyDeviceCanBeDefaultDevice, of: $0.id, scope: kAudioObjectPropertyScopeInput,
+                               orDefault: UInt32(1)) != 0 }
 }
 
 /// Devices with streams in `scope`. Leaves out devices macOS hides and EarSax's own private devices: those have input

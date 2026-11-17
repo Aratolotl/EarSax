@@ -405,7 +405,7 @@ final class MixerModel {
     }
 
     func setShown(_ isShown: Bool, persistentID: String, name: String) {
-        deviceVisibility.choiceByDevice[persistentID] = DeviceVisibility.Choice(isShown: isShown, name: name)
+        deviceVisibility.setShown(isShown, persistentID: persistentID, name: name)
         deviceVisibility.save(to: preferences)
         earSaxLog.notice("\(isShown ? "Showing" : "Hiding") \(name) in EarSax's lists")
     }

@@ -18,8 +18,22 @@ struct DeviceVisibility: Codable, Equatable {
         persistentID.hasPrefix("zoom.us.zoomaudiodevice") || persistentID.hasPrefix("MSLoopbackDriverDevice")
     }
 
+    /// One key per physical device. macOS lists a Bluetooth headset as two devices, "<address>:output" and
+    /// "<address>:input", so both halves share one choice (code review of the input picker, finding 1).
+    static func choiceKey(persistentID: String) -> String {
+        for suffix in [":output", ":input"] where persistentID.hasSuffix(suffix) { return String(persistentID.dropLast(suffix.count)) }
+        return persistentID
+    }
+
     func isShown(persistentID: String) -> Bool {
-        choiceByDevice[persistentID]?.isShown ?? !Self.isMeetingAppDevice(persistentID: persistentID)
+        // The raw ID is the fallback for a choice saved before keys were shared.
+        (choiceByDevice[Self.choiceKey(persistentID: persistentID)] ?? choiceByDevice[persistentID])?.isShown
+            ?? !Self.isMeetingAppDevice(persistentID: persistentID)
+    }
+
+    mutating func setShown(_ isShown: Bool, persistentID: String, name: String) {
+        choiceByDevice[persistentID] = nil
+        choiceByDevice[Self.choiceKey(persistentID: persistentID)] = Choice(isShown: isShown, name: name)
     }
 
     /// The panel's two dropdowns, "Play everything on" and "Sound input": shown devices, plus the one in use even when
@@ -39,14 +53,15 @@ struct DeviceVisibility: Codable, Equatable {
     /// Settings' list: every connected device once (a headset is both an output and an input), then the hidden devices
     /// that are away, so they can be shown again. One choice per device covers both dropdowns.
     func settingsRows(outputs: [AudioDevice], inputs: [AudioDevice]) -> [SettingsDeviceRow] {
-        let outputIDs = Set(outputs.map(\.persistentID))
-        let connected = (outputs + inputs.filter { !outputIDs.contains($0.persistentID) }).map {
-            SettingsDeviceRow(persistentID: $0.persistentID, name: $0.name, symbolName: $0.symbolName, isConnected: true,
-                              isShown: isShown(persistentID: $0.persistentID))
-        }
-        let connectedIDs = Set(connected.map(\.persistentID))
+        var listedKeys: Set<String> = []
+        let connected = (outputs + inputs)
+            .filter { listedKeys.insert(Self.choiceKey(persistentID: $0.persistentID)).inserted }
+            .map {
+                SettingsDeviceRow(persistentID: $0.persistentID, name: $0.name, symbolName: $0.symbolName, isConnected: true,
+                                  isShown: isShown(persistentID: $0.persistentID))
+            }
         let hiddenAndAway = choiceByDevice
-            .filter { !$0.value.isShown && !connectedIDs.contains($0.key) }
+            .filter { !$0.value.isShown && listedKeys.insert(Self.choiceKey(persistentID: $0.key)).inserted }
             .map { SettingsDeviceRow(persistentID: $0.key, name: $0.value.name, symbolName: "powerplug", isConnected: false, isShown: false) }
             .sorted { $0.name.lowercased() < $1.name.lowercased() }
         return connected + hiddenAndAway
