@@ -1,7 +1,7 @@
 import CoreAudio
 import Foundation
 
-/// Which output devices EarSax lists. Hiding only declutters the menus; it never moves sound.
+/// Which devices EarSax lists, outputs and inputs alike. Hiding only declutters the menus; it never moves sound.
 struct DeviceVisibility: Codable, Equatable {
     /// The user's own choices from Settings, by persistent ID. Devices without one use the default.
     var choiceByDevice: [String: Choice] = [:]
@@ -22,17 +22,34 @@ struct DeviceVisibility: Codable, Equatable {
         choiceByDevice[persistentID]?.isShown ?? !Self.isMeetingAppDevice(persistentID: persistentID)
     }
 
-    /// "Play everything on": shown devices, plus the main output even when hidden, so the checkmark is never missing.
-    func listedForPlayEverythingOn(_ devices: [OutputDevice], mainOutput: AudioDeviceID) -> [OutputDevice] {
-        devices.filter { isShown(persistentID: $0.persistentID) || $0.id == mainOutput }
+    /// The panel's two dropdowns, "Play everything on" and "Sound input": shown devices, plus the one in use even when
+    /// hidden, so the checkmark is never missing.
+    func listedForMainMenu(_ devices: [AudioDevice], current: AudioDeviceID) -> [AudioDevice] {
+        devices.filter { isShown(persistentID: $0.persistentID) || $0.id == current }
     }
 
     /// One app's list: shown devices, plus its own pinned or chosen device even when hidden, so that choice can be undone.
-    func listedForApp(_ devices: [OutputDevice], setting: AppVolumeSetting) -> [OutputDevice] {
+    func listedForApp(_ devices: [AudioDevice], setting: AppVolumeSetting) -> [AudioDevice] {
         var ownDevices: Set<String> = []
         if let pinned = setting.alwaysOn?.persistentID { ownDevices.insert(pinned) }
         if case .device(let chosen) = setting.forNow { ownDevices.insert(chosen.persistentID) }
         return devices.filter { isShown(persistentID: $0.persistentID) || ownDevices.contains($0.persistentID) }
+    }
+
+    /// Settings' list: every connected device once (a headset is both an output and an input), then the hidden devices
+    /// that are away, so they can be shown again. One choice per device covers both dropdowns.
+    func settingsRows(outputs: [AudioDevice], inputs: [AudioDevice]) -> [SettingsDeviceRow] {
+        let outputIDs = Set(outputs.map(\.persistentID))
+        let connected = (outputs + inputs.filter { !outputIDs.contains($0.persistentID) }).map {
+            SettingsDeviceRow(persistentID: $0.persistentID, name: $0.name, symbolName: $0.symbolName, isConnected: true,
+                              isShown: isShown(persistentID: $0.persistentID))
+        }
+        let connectedIDs = Set(connected.map(\.persistentID))
+        let hiddenAndAway = choiceByDevice
+            .filter { !$0.value.isShown && !connectedIDs.contains($0.key) }
+            .map { SettingsDeviceRow(persistentID: $0.key, name: $0.value.name, symbolName: "powerplug", isConnected: false, isShown: false) }
+            .sorted { $0.name.lowercased() < $1.name.lowercased() }
+        return connected + hiddenAndAway
     }
 
     // MARK: Saving

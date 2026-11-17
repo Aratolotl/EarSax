@@ -160,8 +160,8 @@ private let everything: Set<String> = ["laptop", "display", "speaker"]
 
 // MARK: - Hidden devices (Settings)
 
-private func outputDevice(_ id: AudioDeviceID, _ persistentID: String) -> OutputDevice {
-    OutputDevice(id: id, persistentID: persistentID, name: persistentID, symbolName: "hifispeaker.fill")
+private func outputDevice(_ id: AudioDeviceID, _ persistentID: String) -> AudioDevice {
+    AudioDevice(id: id, persistentID: persistentID, name: persistentID, symbolName: "hifispeaker.fill")
 }
 
 @Test func hidingOnlyDecluttersTheLists() {
@@ -169,16 +169,29 @@ private func outputDevice(_ id: AudioDeviceID, _ persistentID: String) -> Output
     let devices = [outputDevice(1, "speaker"), outputDevice(2, "zoom.us.zoomaudiodevice.001"),
                    outputDevice(3, "MSLoopbackDriverDevice_UID"), outputDevice(4, "BlackHole2ch_UID"), outputDevice(5, "display")]
     var visibility = DeviceVisibility()
-    #expect(visibility.listedForPlayEverythingOn(devices, mainOutput: 1).map(\.persistentID) == ["speaker", "BlackHole2ch_UID", "display"])
+    #expect(visibility.listedForMainMenu(devices, current: 1).map(\.persistentID) == ["speaker", "BlackHole2ch_UID", "display"])
 
     visibility.choiceByDevice["display"] = .init(isShown: false, name: "Studio Display")
     visibility.choiceByDevice["zoom.us.zoomaudiodevice.001"] = .init(isShown: true, name: "ZoomAudioDevice")   // the user wins
-    #expect(visibility.listedForPlayEverythingOn(devices, mainOutput: 1).map(\.persistentID) == ["speaker", "zoom.us.zoomaudiodevice.001", "BlackHole2ch_UID"])
-    #expect(visibility.listedForPlayEverythingOn(devices, mainOutput: 5).map(\.persistentID).contains("display"))   // hidden but in use
+    #expect(visibility.listedForMainMenu(devices, current: 1).map(\.persistentID) == ["speaker", "zoom.us.zoomaudiodevice.001", "BlackHole2ch_UID"])
+    #expect(visibility.listedForMainMenu(devices, current: 5).map(\.persistentID).contains("display"))   // hidden but in use
 
     let pinnedToDisplay = AppVolumeSetting(alwaysOn: SavedDevice(persistentID: "display", name: "Studio Display"))
     #expect(visibility.listedForApp(devices, setting: pinnedToDisplay).map(\.persistentID).contains("display"))
     #expect(!visibility.listedForApp(devices, setting: .untouched).map(\.persistentID).contains("display"))
+}
+
+@Test func settingsListEachDeviceOnceForOutputAndInput() {
+    // A headset is both an output and an input: one row, one choice for both dropdowns.
+    let headset = outputDevice(1, "headset")
+    let microphone = AudioDevice(id: 2, persistentID: "usb-mic", name: "usb-mic", symbolName: "mic")
+    var visibility = DeviceVisibility()
+    visibility.choiceByDevice["away"] = .init(isShown: false, name: "Away Speaker")
+    visibility.choiceByDevice["headset"] = .init(isShown: false, name: "headset")
+    let rows = visibility.settingsRows(outputs: [headset], inputs: [headset, microphone])
+    #expect(rows.map(\.persistentID) == ["headset", "usb-mic", "away"])
+    #expect(rows.map(\.isConnected) == [true, true, false])
+    #expect(visibility.listedForMainMenu([headset, microphone], current: 2).map(\.persistentID) == ["usb-mic"])   // hidden in the input menu too
 }
 
 @Test func hiddenDeviceChoicesSurviveSaveAndReload() throws {
@@ -293,6 +306,9 @@ private func runOneAudioCycle(_ copier: TapAudioCopier, frameCount: Int) -> [Flo
     #expect(outputSymbolName(transportType: kAudioDeviceTransportTypeBuiltIn, terminalType: 769, dataSource: 0x6973_706B) == "laptopcomputer")   // 'ispk'
     #expect(outputSymbolName(transportType: kAudioDeviceTransportTypeBuiltIn, terminalType: 0, dataSource: 0x6864_706E) == "headphones")        // 'hdpn'
     #expect(outputSymbolName(transportType: kAudioDeviceTransportTypeDisplayPort, terminalType: 0, dataSource: 0) == "display")
+    #expect(inputSymbolName(transportType: kAudioDeviceTransportTypeBuiltIn) == "laptopcomputer")
+    #expect(inputSymbolName(transportType: kAudioDeviceTransportTypeUSB) == "mic")
+    #expect(inputSymbolName(transportType: kAudioDeviceTransportTypeVirtual) == "waveform")
 }
 
 @Test func earSaxOwnPrivateDevicesAreNotOfferedAsOutputs() {

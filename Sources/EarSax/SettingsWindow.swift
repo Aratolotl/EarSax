@@ -42,7 +42,7 @@ struct SettingsView: View {
             } header: {
                 Text("Show in EarSax's lists")
             } footer: {
-                Text("Hiding a device only removes it from EarSax's lists. Anything already playing there keeps playing.")
+                Text("Hiding a device only removes it from EarSax's lists, for sound output and input alike. Anything already using it keeps using it.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }

@@ -1,8 +1,9 @@
 import CoreAudio
 import Foundation
 
-/// A device the Mac can play sound through (speakers, headphones, a display, a USB interface).
-struct OutputDevice: Identifiable, Hashable {
+/// A device the Mac can play sound through (speakers, headphones, a display, a USB interface) or take sound in from
+/// (a microphone). A headset is both, and shows up in both lists.
+struct AudioDevice: Identifiable, Hashable {
     let id: AudioDeviceID
     /// Stable across reboots and reconnections; Core Audio needs it to build EarSax's private devices.
     let persistentID: String
@@ -13,24 +14,35 @@ struct OutputDevice: Identifiable, Hashable {
     var isBluetooth = false
 }
 
-func listOutputDevices() -> [OutputDevice] {
+func listOutputDevices() -> [AudioDevice] {
+    listDevices(scope: kAudioObjectPropertyScopeOutput) { deviceID, firstStream, transportType in
+        outputSymbolName(transportType: transportType,
+                         terminalType: readProperty(kAudioStreamPropertyTerminalType, of: firstStream, orDefault: UInt32(0)),
+                         dataSource: readProperty(kAudioDevicePropertyDataSource, of: deviceID,
+                                                  scope: kAudioObjectPropertyScopeOutput, orDefault: UInt32(0)))
+    }
+}
+
+func listInputDevices() -> [AudioDevice] {
+    listDevices(scope: kAudioObjectPropertyScopeInput) { _, _, transportType in inputSymbolName(transportType: transportType) }
+}
+
+/// Devices with streams in `scope`. Leaves out devices macOS hides and EarSax's own private devices: those have input
+/// streams (the captured app sound), so without the check they'd be offered as microphones.
+private func listDevices(scope: AudioObjectPropertyScope,
+                         symbolName: (AudioDeviceID, _ firstStream: AudioStreamID, _ transportType: UInt32) -> String) -> [AudioDevice] {
     readPropertyList(kAudioHardwarePropertyDevices, of: coreAudioSystem, elementType: AudioDeviceID.self).compactMap { deviceID in
-        let outputStreams = readPropertyList(kAudioDevicePropertyStreams, of: deviceID,
-                                             scope: kAudioObjectPropertyScopeOutput, elementType: AudioStreamID.self)
+        let streams = readPropertyList(kAudioDevicePropertyStreams, of: deviceID, scope: scope, elementType: AudioStreamID.self)
         let isHidden: UInt32 = readProperty(kAudioDevicePropertyIsHidden, of: deviceID, orDefault: 0)
-        guard !outputStreams.isEmpty, isHidden == 0,
+        guard !streams.isEmpty, isHidden == 0,
               let persistentID = readTextProperty(kAudioDevicePropertyDeviceUID, of: deviceID),
               !isEarSaxPrivateDevice(persistentID: persistentID) else { return nil }
         let transportType: UInt32 = readProperty(kAudioDevicePropertyTransportType, of: deviceID, orDefault: 0)
-        return OutputDevice(id: deviceID,
-                            persistentID: persistentID,
-                            name: readTextProperty(kAudioObjectPropertyName, of: deviceID) ?? "Unnamed device",
-                            symbolName: outputSymbolName(
-                                transportType: transportType,
-                                terminalType: readProperty(kAudioStreamPropertyTerminalType, of: outputStreams[0], orDefault: UInt32(0)),
-                                dataSource: readProperty(kAudioDevicePropertyDataSource, of: deviceID,
-                                                         scope: kAudioObjectPropertyScopeOutput, orDefault: UInt32(0))),
-                            isBluetooth: transportType == kAudioDeviceTransportTypeBluetooth || transportType == kAudioDeviceTransportTypeBluetoothLE)
+        return AudioDevice(id: deviceID,
+                           persistentID: persistentID,
+                           name: readTextProperty(kAudioObjectPropertyName, of: deviceID) ?? "Unnamed device",
+                           symbolName: symbolName(deviceID, streams[0], transportType),
+                           isBluetooth: transportType == kAudioDeviceTransportTypeBluetooth || transportType == kAudioDeviceTransportTypeBluetoothLE)
     }
 }
 
@@ -64,6 +76,16 @@ func outputSymbolName(transportType: UInt32, terminalType: UInt32, dataSource: U
     }
 }
 
+/// Inputs by where the microphone sits: the Mac's own, a Bluetooth headset, an app's virtual device, anything else.
+func inputSymbolName(transportType: UInt32) -> String {
+    switch transportType {
+    case kAudioDeviceTransportTypeBuiltIn: return "laptopcomputer"
+    case kAudioDeviceTransportTypeBluetooth, kAudioDeviceTransportTypeBluetoothLE: return "headphones"
+    case kAudioDeviceTransportTypeVirtual: return "waveform"
+    default: return "mic"
+    }
+}
+
 /// The device currently connected under this persistent ID, or kAudioObjectUnknown if it's gone (switched off, unplugged).
 func deviceID(forPersistentID persistentID: String) -> AudioDeviceID {
     var address = propertyAddress(kAudioHardwarePropertyTranslateUIDToDevice)
@@ -89,6 +111,20 @@ func systemOutputDeviceID() -> AudioDeviceID {
 func makeSystemOutputDevice(_ device: AudioDeviceID) -> Bool {
     let status = writeProperty(kAudioHardwarePropertyDefaultOutputDevice, of: coreAudioSystem, value: device)
     if status != noErr { earSaxLog.error("Switching output to device \(device) failed: \(readableStatus(status))") }
+    return status == noErr
+}
+
+// MARK: - The Mac's current input
+
+func systemInputDeviceID() -> AudioDeviceID {
+    readProperty(kAudioHardwarePropertyDefaultInputDevice, of: coreAudioSystem, orDefault: AudioDeviceID(kAudioObjectUnknown))
+}
+
+/// False if macOS refused the switch.
+@discardableResult
+func makeSystemInputDevice(_ device: AudioDeviceID) -> Bool {
+    let status = writeProperty(kAudioHardwarePropertyDefaultInputDevice, of: coreAudioSystem, value: device)
+    if status != noErr { earSaxLog.error("Switching input to device \(device) failed: \(readableStatus(status))") }
     return status == noErr
 }
 

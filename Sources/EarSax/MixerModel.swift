@@ -7,13 +7,23 @@ import Observation
 final class MixerModel {
     // MARK: Output
 
-    private(set) var outputDevices: [OutputDevice] = []
+    private(set) var outputDevices: [AudioDevice] = []
     private(set) var currentOutputDeviceID = AudioDeviceID(kAudioObjectUnknown)
     /// 0...1, or nil when macOS can't set this device's volume.
     private(set) var outputVolume: Float?
     private(set) var isOutputMuted = false
     /// False for devices whose volume macOS can set but not mute (some USB interfaces): the mute button is hidden.
     private(set) var canMuteOutputDevice = false
+
+    // MARK: Input
+
+    /// Microphones and other inputs. EarSax only switches which one the Mac uses; it never reads their sound.
+    private(set) var inputDevices: [AudioDevice] = []
+    private(set) var currentInputDeviceID = AudioDeviceID(kAudioObjectUnknown)
+
+    var mainInputDevice: AudioDevice? {
+        inputDevices.first { $0.id == currentInputDeviceID }
+    }
 
     // MARK: Apps
 
@@ -75,12 +85,17 @@ final class MixerModel {
     /// Reads the current state and starts listening for changes. Call once at launch.
     func start() {
         refreshOutputDevices()
+        refreshInputDevices()
         refreshApps()
         whenPropertyChanges(kAudioHardwarePropertyDefaultOutputDevice, of: coreAudioSystem) { [weak self] in
             self?.outputDeviceChanged()
         }
+        whenPropertyChanges(kAudioHardwarePropertyDefaultInputDevice, of: coreAudioSystem) { [weak self] in
+            self?.refreshInputDevices()
+        }
         whenPropertyChanges(kAudioHardwarePropertyDevices, of: coreAudioSystem) { [weak self] in
             self?.refreshOutputDevices()
+            self?.refreshInputDevices()
             self?.refreshApps()
         }
         whenPropertyChanges(kAudioHardwarePropertyProcessObjectList, of: coreAudioSystem) { [weak self] in
@@ -107,6 +122,11 @@ final class MixerModel {
             if case .device(let device) = forNow { return !connectedDevices.contains(device.persistentID) }
             return false
         }
+    }
+
+    func refreshInputDevices() {
+        inputDevices = listInputDevices()
+        currentInputDeviceID = systemInputDeviceID()
     }
 
     func refreshOutputVolume() {
@@ -279,12 +299,12 @@ final class MixerModel {
     // MARK: Per-app output
 
     /// The Mac's current output: where every app plays unless it has a device of its own.
-    var mainOutputDevice: OutputDevice? {
+    var mainOutputDevice: AudioDevice? {
         outputDevices.first { $0.id == currentOutputDeviceID }
     }
 
     /// The device an app plays on now: its own while that's connected, otherwise the main output.
-    func outputDevice(for appID: String) -> OutputDevice? {
+    func outputDevice(for appID: String) -> AudioDevice? {
         guard let persistentID = outputDevicePersistentID(for: appID) else { return nil }
         return outputDevices.first { $0.persistentID == persistentID }
     }
@@ -299,7 +319,7 @@ final class MixerModel {
     }
 
     /// A pick in the app's device list: play there for now; a pinned device stays pinned. nil = "Same as everything else".
-    func playForNow(on device: OutputDevice?, for app: AudioApp) {
+    func playForNow(on device: AudioDevice?, for app: AudioApp) {
         var changed = setting(for: app.id)
         changed.playForNow(on: device.map { SavedDevice(persistentID: $0.persistentID, name: $0.name) })
         // The user's clicks are logged too, so a QA log shows what was clicked and not only what moved.
@@ -368,26 +388,20 @@ final class MixerModel {
 
     // MARK: Hidden devices
 
-    var devicesForPlayEverythingOn: [OutputDevice] {
-        deviceVisibility.listedForPlayEverythingOn(outputDevices, mainOutput: currentOutputDeviceID)
+    var devicesForPlayEverythingOn: [AudioDevice] {
+        deviceVisibility.listedForMainMenu(outputDevices, current: currentOutputDeviceID)
     }
 
-    func devicesForAppList(_ appID: String) -> [OutputDevice] {
+    var devicesForSoundInput: [AudioDevice] {
+        deviceVisibility.listedForMainMenu(inputDevices, current: currentInputDeviceID)
+    }
+
+    func devicesForAppList(_ appID: String) -> [AudioDevice] {
         deviceVisibility.listedForApp(outputDevices, setting: setting(for: appID))
     }
 
-    /// Every connected device, plus devices the user hid that are away, so they can be shown again.
     var devicesForSettings: [SettingsDeviceRow] {
-        let connected = outputDevices.map {
-            SettingsDeviceRow(persistentID: $0.persistentID, name: $0.name, symbolName: $0.symbolName, isConnected: true,
-                              isShown: deviceVisibility.isShown(persistentID: $0.persistentID))
-        }
-        let connectedIDs = Set(outputDevices.map(\.persistentID))
-        let hiddenAndAway = deviceVisibility.choiceByDevice
-            .filter { !$0.value.isShown && !connectedIDs.contains($0.key) }
-            .map { SettingsDeviceRow(persistentID: $0.key, name: $0.value.name, symbolName: "powerplug", isConnected: false, isShown: false) }
-            .sorted { $0.name.lowercased() < $1.name.lowercased() }
-        return connected + hiddenAndAway
+        deviceVisibility.settingsRows(outputs: outputDevices, inputs: inputDevices)
     }
 
     func setShown(_ isShown: Bool, persistentID: String, name: String) {
@@ -399,12 +413,19 @@ final class MixerModel {
     // MARK: Output actions
 
     /// "Play everything on": the Mac's output changes and every app follows, except apps with an "always" rule.
-    func selectOutputDevice(_ device: OutputDevice) {
+    func selectOutputDevice(_ device: AudioDevice) {
         earSaxLog.notice("Picked \(device.name) under Play everything on")
         endTemporaryOutputs { _ in true }
         // A switch sends a change notification, which refreshes the panel and moves the taps. Picking the current device, or
         // a switch macOS refused, sends none, so the apps that just lost their own output are moved here.
         if device.id == currentOutputDeviceID || !makeSystemOutputDevice(device.id) { refreshApps() }
+    }
+
+    /// "Sound input": the Mac's input changes for every app. No tap is involved. A refused switch sends no change
+    /// notification, so the list is re-read to keep the checkmark honest.
+    func selectInputDevice(_ device: AudioDevice) {
+        earSaxLog.notice("Picked \(device.name) under Sound input")
+        if !makeSystemInputDevice(device.id) { refreshInputDevices() }
     }
 
     func setOutputVolume(_ volume: Float) {
