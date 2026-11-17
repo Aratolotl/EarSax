@@ -29,7 +29,8 @@ struct EventLog: Sendable {
 
     // ponytail: no rotation; a line per tap event stays tiny. Add rotation if the file ever grows past a few MB.
     private func appendToFile(_ message: String) {
-        let line = Data("\(Date().ISO8601Format()) \(message)\n".utf8)
+        // Milliseconds, so QA can measure a switch's gaps from the log.
+        let line = Data("\(Date().ISO8601Format(.iso8601.year().month().day().time(includingFractionalSeconds: true))) \(message)\n".utf8)
         fileWritingQueue.async { [logFile] in
             if let file = try? FileHandle(forWritingTo: logFile) {
                 _ = try? file.seekToEnd()

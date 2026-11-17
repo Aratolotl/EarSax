@@ -379,8 +379,9 @@ final class MixerModel {
         moveTapsToTheirOutputs()
     }
 
-    private func outputDevicePersistentID(for appID: String) -> String? {
-        guard let mainOutput = mainOutputDevice else { return nil }
+    /// `mainOutput`: the main output to plan for, when it's about to change; the current one otherwise.
+    private func outputDevicePersistentID(for appID: String, mainOutput: OutputDevice? = nil) -> String? {
+        guard let mainOutput = mainOutput ?? mainOutputDevice else { return nil }
         return setting(for: appID).outputDevicePersistentID(mainOutput: mainOutput.persistentID,
                                                             connectedDevices: Set(outputDevices.map(\.persistentID)))
     }
@@ -398,9 +399,9 @@ final class MixerModel {
     }
 
     /// Keeps every tap playing where its app should. Covers tapped apps that aren't running: their taps wait for them.
-    private func moveTapsToTheirOutputs() {
+    private func moveTapsToTheirOutputs(mainOutput: OutputDevice? = nil) {
         for appID in tappedAppIDs {
-            guard let playsOnDevice = outputDevicePersistentID(for: appID) else { continue }
+            guard let playsOnDevice = outputDevicePersistentID(for: appID, mainOutput: mainOutput) else { continue }
             tapController.moveTap(appID: appID, toOutputDevice: playsOnDevice)
         }
     }
@@ -458,9 +459,18 @@ final class MixerModel {
     func selectOutputDevice(_ device: AudioDevice) {
         earSaxLog.notice("Picked \(device.name) under Play everything on")
         endTemporaryOutputs { _ in true }
-        // A switch sends a change notification, which refreshes the panel and moves the taps. Picking the current device, or
-        // a switch macOS refused, sends none, so the apps that just lost their own output are moved here.
-        if device.id == currentOutputDeviceID || !makeSystemOutputDevice(device.id) { refreshApps() }
+        // The taps move first, then the Mac's output. The other way round, the apps already played toward the new device
+        // while their taps still sent them to the old one, for the half second to a second it took macOS to report the switch
+        // and EarSax to follow: the old device played again between two cuts (listening test, 2026-11-16).
+        moveTapsToTheirOutputs(mainOutput: device)
+        // ponytail: waits behind the tap queue; while the queue waits on the permission prompt, the switch waits too.
+        tapController.afterQueuedWork { [weak self] in
+            guard let self else { return }
+            earSaxLog.notice("Taps moved; switching the Mac's output to \(device.name)")
+            // A switch sends a change notification, which refreshes the panel. Picking the current device, or a switch macOS
+            // refused, sends none, so the taps are put back where they belong here.
+            if device.id == currentOutputDeviceID || !makeSystemOutputDevice(device.id) { refreshApps() }
+        }
     }
 
     /// "Sound input": the Mac's input changes for every app. No tap is involved. A refused switch sends no change
@@ -489,6 +499,9 @@ final class MixerModel {
     private func outputDeviceChanged() {
         let changedAt = ContinuousClock.now
         refreshOutputDevices()
+        // Before anything slower (listing every app), so a switch made outside EarSax (Control Center, a device turning off)
+        // leaves the old device as soon as possible. A switch picked in EarSax already moved them; then this does nothing.
+        moveTapsToTheirOutputs()
         watchCurrentOutputDevice()
         earSaxLog.notice("Main output is now \(mainOutputDevice?.name ?? "unknown")")
         applyDefaultVolumeAfterOutputChange()

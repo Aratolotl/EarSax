@@ -315,6 +315,11 @@ final class TapController: @unchecked Sendable {
         }
     }
 
+    /// Runs `action` on the main thread once every tap change asked for before it is done (the queue is serial).
+    func afterQueuedWork(_ action: @escaping @MainActor @Sendable () -> Void) {
+        tapQueue.async { Task { @MainActor in action() } }
+    }
+
     func removeTap(appID: String) {
         tapQueue.async { [self] in
             failedAttemptByApp[appID] = nil
