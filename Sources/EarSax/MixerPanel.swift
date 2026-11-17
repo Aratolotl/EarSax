@@ -216,7 +216,13 @@ private struct AlertSoundsRow: View {
                         .foregroundStyle(.secondary)
                         .frame(width: 18, height: 18)
                         .accessibilityHidden(true)
-                    Text("Alert sounds").lineLimit(1)
+                    VStack(alignment: .leading, spacing: 0) {
+                        Text("Alert sounds").lineLimit(1)
+                        // macOS can play alerts on a device of their own; EarSax leaves that choice alone (R32), so say it.
+                        if let device = mixer.alertDeviceNameIfElsewhere {
+                            Text("On \(device)").font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                        }
+                    }
                     Spacer()
                     Text("\(Int((volume * 100).rounded()))%")
                         .font(.caption.monospacedDigit())
