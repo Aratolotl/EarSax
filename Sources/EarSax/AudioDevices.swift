@@ -19,14 +19,12 @@ struct AudioDevice: Identifiable, Hashable {
 /// The microphone to switch back to when Bluetooth headphones connect and macOS makes their microphone the Mac's input:
 /// that switch drops the headphones to hands-free sound, muffled at 16 kHz, for everything they play (rulings R26, R28).
 /// Returns nil to leave the input alone.
-/// - `previous`: the input in use just before; `current`: the input now.
+/// - `lastNonBluetoothInput`: the persistent ID of the last input in use that wasn't Bluetooth; `current`: the input now.
 /// - `justConnected`: true when `current` connected a moment ago, so this is macOS's automatic switch, not the user's pick.
-func microphoneToKeep(previous: AudioDevice?, current: AudioDevice?, justConnected: Bool,
+func microphoneToKeep(lastNonBluetoothInput: String?, current: AudioDevice?, justConnected: Bool,
                       inputs: [AudioDevice]) -> AudioDevice? {
     guard let current, current.isBluetooth, justConnected else { return nil }
-    if let previous, !previous.isBluetooth, let stillThere = inputs.first(where: { $0.persistentID == previous.persistentID }) {
-        return stillThere
-    }
+    if let stillThere = inputs.first(where: { $0.persistentID == lastNonBluetoothInput }) { return stillThere }
     return inputs.first(where: \.isBuiltIn)   // nil when the headphones are the only microphone: they stay
 }
 

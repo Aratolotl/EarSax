@@ -343,11 +343,11 @@ private func runOneAudioCycle(_ copier: TapAudioCopier, frameCount: Int) -> [Flo
     let earbuds = AudioDevice(id: 3, persistentID: "AA-BB:input", name: "Earbuds", symbolName: "headphones", isBluetooth: true)
     let all = [builtIn, usb, earbuds]
     // Back to the one used before; if it's gone, the built-in microphone.
-    #expect(microphoneToKeep(previous: usb, current: earbuds, justConnected: true, inputs: all) == usb)
-    #expect(microphoneToKeep(previous: usb, current: earbuds, justConnected: true, inputs: [builtIn, earbuds]) == builtIn)
-    #expect(microphoneToKeep(previous: nil, current: earbuds, justConnected: true, inputs: all) == builtIn)
+    #expect(microphoneToKeep(lastNonBluetoothInput: "usb-mic", current: earbuds, justConnected: true, inputs: all) == usb)
+    #expect(microphoneToKeep(lastNonBluetoothInput: "usb-mic", current: earbuds, justConnected: true, inputs: [builtIn, earbuds]) == builtIn)
+    #expect(microphoneToKeep(lastNonBluetoothInput: nil, current: earbuds, justConnected: true, inputs: all) == builtIn)
     // Left alone: the user's own later pick, a non-Bluetooth input, or headphones that are the only microphone.
-    #expect(microphoneToKeep(previous: usb, current: earbuds, justConnected: false, inputs: all) == nil)
-    #expect(microphoneToKeep(previous: builtIn, current: usb, justConnected: true, inputs: all) == nil)
-    #expect(microphoneToKeep(previous: nil, current: earbuds, justConnected: true, inputs: [earbuds]) == nil)
+    #expect(microphoneToKeep(lastNonBluetoothInput: "usb-mic", current: earbuds, justConnected: false, inputs: all) == nil)
+    #expect(microphoneToKeep(lastNonBluetoothInput: "BuiltInMicrophoneDevice", current: usb, justConnected: true, inputs: all) == nil)
+    #expect(microphoneToKeep(lastNonBluetoothInput: nil, current: earbuds, justConnected: true, inputs: [earbuds]) == nil)
 }

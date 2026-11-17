@@ -35,6 +35,12 @@ final class MixerModel {
     private static let automaticSwitchWindow: Duration = .seconds(5)
     /// False until the first listing, so devices already connected at launch don't count as just connected.
     @ObservationIgnored private var hasListedInputs = false
+    /// The last input in use that wasn't Bluetooth: what EarSax switches back to. Kept as its own record, because macOS
+    /// may switch to the headphones before EarSax's listing includes them (code review of the microphone rule, finding 3).
+    @ObservationIgnored private var lastNonBluetoothInput: String?
+    /// The input in use at the last refresh that found it in the list. A switch is one away from this, so an input that
+    /// macOS picked before it was listed still counts once it shows up.
+    @ObservationIgnored private var lastListedInputID = AudioDeviceID(kAudioObjectUnknown)
 
     // MARK: Apps
 
@@ -138,7 +144,6 @@ final class MixerModel {
 
     /// Works in either order of macOS's two notices (devices changed, input changed): each refresh compares with the last.
     func refreshInputDevices() {
-        let previousInput = mainInputDevice
         let knownBefore = Set(inputDevices.map(\.persistentID))
         inputDevices = listInputDevices()
         currentInputDeviceID = systemInputDeviceID()
@@ -151,13 +156,19 @@ final class MixerModel {
         hasListedInputs = true
         bluetoothInputConnectedAt = bluetoothInputConnectedAt.filter { now - $0.value < Self.automaticSwitchWindow }
 
-        guard keepsMacMicrophoneWithBluetooth, let current = mainInputDevice,
-              let keep = microphoneToKeep(previous: previousInput, current: current,
+        guard let current = mainInputDevice else { return }
+        if !current.isBluetooth { lastNonBluetoothInput = current.persistentID }
+        let switchedSinceLastRefresh = current.id != lastListedInputID
+        lastListedInputID = current.id
+        // Only a switch made since the last refresh: a Bluetooth microphone the user already uses, missing from one listing
+        // for a moment, is never switched away (finding 3). The entry lives out its 5 seconds, so a second switch macOS
+        // makes while the headphones finish connecting is undone too (finding 4).
+        guard keepsMacMicrophoneWithBluetooth, switchedSinceLastRefresh,
+              let keep = microphoneToKeep(lastNonBluetoothInput: lastNonBluetoothInput, current: current,
                                           justConnected: bluetoothInputConnectedAt[current.persistentID] != nil,
                                           inputs: inputDevices) else { return }
-        bluetoothInputConnectedAt[current.persistentID] = nil   // once: the user can still pick the headphones after
         earSaxLog.notice("\(current.name) took the microphone as it connected; switching back to \(keep.name) so it keeps full sound quality")
-        if makeSystemInputDevice(keep.id) { currentInputDeviceID = keep.id }
+        if makeSystemInputDevice(keep.id) { currentInputDeviceID = keep.id; lastListedInputID = keep.id }
     }
 
     func refreshOutputVolume() {

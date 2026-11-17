@@ -138,7 +138,7 @@ private struct InputRow: View {
     let mixer: MixerModel
 
     var body: some View {
-        if mixer.inputDevices.count >= 2 {
+        if mixer.devicesForSoundInput.count >= 2 {
             Menu {
                 Section("Sound input") {
                     ForEach(mixer.devicesForSoundInput) { device in
