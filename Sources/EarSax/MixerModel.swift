@@ -14,6 +14,8 @@ final class MixerModel {
     private(set) var isOutputMuted = false
     /// False for devices whose volume macOS can set but not mute (some USB interfaces): the mute button is hidden.
     private(set) var canMuteOutputDevice = false
+    /// macOS's alert volume, 0...1 (ruling R30), or nil until read or if it can't be.
+    private(set) var alertVolume: Float?
 
     // MARK: Input
 
@@ -102,6 +104,12 @@ final class MixerModel {
 
     /// Reads the current state and starts listening for changes. Call once at launch.
     func start() {
+        // The first alert-volume read loads macOS's scripting machinery, which blocks for about a second. Done once here,
+        // while the panel is closed, so opening the panel never waits for it.
+        Task { [weak self] in
+            try? await Task.sleep(for: .seconds(2))
+            self?.refreshAlertVolume()
+        }
         refreshOutputDevices()
         refreshInputDevices()
         refreshApps()
@@ -175,6 +183,15 @@ final class MixerModel {
         outputVolume = readOutputVolume(of: currentOutputDeviceID)
         isOutputMuted = readOutputMute(of: currentOutputDeviceID)
         canMuteOutputDevice = canMuteOutput(of: currentOutputDeviceID)
+    }
+
+    /// Read each time the panel opens, so a change made in System Settings shows; never polled while it's closed.
+    func refreshAlertVolume() {
+        alertVolume = readAlertVolume()
+    }
+
+    func setAlertVolume(_ volume: Float) {
+        if writeAlertVolume(volume) { alertVolume = volume }
     }
 
     func refreshApps() {
@@ -414,10 +431,9 @@ final class MixerModel {
 
     /// Keeps every tap playing where its app should. Covers tapped apps that aren't running: their taps wait for them.
     private func moveTapsToTheirOutputs() {
-        for appID in tappedAppIDs {
-            guard let playsOnDevice = outputDevicePersistentID(for: appID) else { continue }
-            tapController.moveTap(appID: appID, toOutputDevice: playsOnDevice)
-        }
+        var outputByApp: [String: String] = [:]
+        for appID in tappedAppIDs { outputByApp[appID] = outputDevicePersistentID(for: appID) }
+        tapController.moveTaps(outputByApp)
     }
 
     // MARK: Default volume

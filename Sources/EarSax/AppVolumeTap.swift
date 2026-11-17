@@ -17,31 +17,101 @@ final class RealtimeVolumeState: Sendable {
     }
 }
 
-/// One tap's audio callback: copies the app's captured audio to the speakers with its volume applied.
-/// Each tap has its own copier, so two taps briefly overlapping during a device switch never disturb each other's glide
-/// (code review, finding 3).
+/// What one speaker channel plays.
+enum SpeakerFeed: Equatable {
+    case left, right, bothMixed, silent
+}
+
+/// Which captured channel a speaker channel plays. The app's stereo goes to the device's stereo pair only (macOS's
+/// "Configure Speakers" choice, 0-based here), so an 8-output audio interface no longer plays music on all 8 outputs;
+/// a mono speaker gets left and right mixed, instead of the left channel only (FineTune #105). A pair that doesn't fit
+/// the device falls back to the first two channels.
+func speakerFeed(channel: Int, speakerChannelCount: Int, stereoPair: (left: Int, right: Int)) -> SpeakerFeed {
+    if speakerChannelCount == 1 { return .bothMixed }
+    let channels = 0..<speakerChannelCount
+    let pairFits = stereoPair.left != stereoPair.right && channels.contains(stereoPair.left) && channels.contains(stereoPair.right)
+    let pair = pairFits ? stereoPair : (left: 0, right: 1)
+    return channel == pair.left ? .left : channel == pair.right ? .right : .silent
+}
+
+/// Equal-power crossfade curve: at `progress` 0 silent, at 1 full. The old path plays `gain(1 - p)` while the new one plays
+/// `gain(p)`, and their squares always add up to 1, so the level doesn't dip halfway through the fade.
+func equalPowerGain(_ progress: Float) -> Float {
+    progress >= 1 ? 1 : progress <= 0 ? 0 : sin(progress * .pi / 2)
+}
+
+/// One private device's audio callback: copies the app's captured audio to the speakers with its volume applied, and
+/// fades in or out during a crossfade. Each private device has its own copier, so two overlapping during a switch never
+/// disturb each other's glide (code review, finding 3).
 final class TapAudioCopier: Sendable {
     private let volume: RealtimeVolumeState
     /// The multiplier applied at the end of the last audio cycle; lets the volume glide to a new target without a click.
     /// Starts at the app's current volume, so a new tap never glides down from 100% (no blip when a tap is rebuilt).
     private let appliedVolumeMultiplier: Atomic<UInt32>
+    /// Crossfade position, 0 (silent) to 1 (full); moves toward the target by the step on each frame. Written by the audio
+    /// thread, except when `jumpFade` sets it for a device that isn't running.
+    private let fadeProgress: Atomic<UInt32>
+    private let fadeTarget: Atomic<UInt32>
+    private let fadeStepPerFrame = Atomic<UInt32>(Float(1).bitPattern)
+    /// The device's stereo pair, 0-based (see `speakerFeed`).
+    private let leftSpeakerChannel = Atomic<Int>(0)
+    private let rightSpeakerChannel = Atomic<Int>(1)
+    /// For the crossfade's checks: has the callback run, has it seen sound since it started, and when it last did.
+    private let audioCycleCount = Atomic<Int>(0)
+    private let lastSoundAtNanoseconds = Atomic<UInt64>(0)
+    private let heardSound = Atomic<Bool>(false)
 
-    init(volume: RealtimeVolumeState) {
+    init(volume: RealtimeVolumeState, fadedIn: Bool = true) {
         self.volume = volume
         appliedVolumeMultiplier = Atomic(volume.currentTargetVolumeMultiplier.bitPattern)
+        fadeProgress = Atomic(Float(fadedIn ? 1 : 0).bitPattern)
+        fadeTarget = Atomic(Float(fadedIn ? 1 : 0).bitPattern)
+    }
+
+    func useStereoPair(_ pair: (left: Int, right: Int)) {
+        leftSpeakerChannel.store(pair.left, ordering: .relaxed)
+        rightSpeakerChannel.store(pair.right, ordering: .relaxed)
+    }
+
+    /// Fades to `target` (0 or 1) over `frames` audio frames, on the audio thread.
+    func startFade(to target: Float, overFrames frames: Double) {
+        fadeStepPerFrame.store(Float(1 / max(frames, 1)).bitPattern, ordering: .relaxed)
+        fadeTarget.store(target.bitPattern, ordering: .relaxed)
+    }
+
+    /// Sets the fade at once: for a device whose callback isn't running (the app is silent), so nothing would move it.
+    func jumpFade(to target: Float) {
+        startFade(to: target, overFrames: 1)
+        fadeProgress.store(target.bitPattern, ordering: .relaxed)
+    }
+
+    var hasRunAudioCycle: Bool { audioCycleCount.load(ordering: .relaxed) > 0 }
+    var hasHeardSound: Bool { heardSound.load(ordering: .relaxed) }
+
+    func heardSound(within window: Duration) -> Bool {
+        let last = lastSoundAtNanoseconds.load(ordering: .relaxed)
+        let windowNanoseconds = UInt64(window.components.seconds) * 1_000_000_000 + UInt64(window.components.attoseconds / 1_000_000_000)
+        return last > 0 && clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - last < windowNanoseconds
     }
 
     /// Runs on the real-time audio thread: no allocation, no locks.
     /// Glides from the last volume to the new one across the cycle, so a moving slider never clicks.
-    /// ponytail: speaker channel N plays captured channel (N mod capturedChannelCount), so 5.1 outputs get stereo on every
-    /// speaker. Proper surround mapping when someone needs it.
     func copyAppAudioToSpeakers(captured: UnsafeMutableAudioBufferListPointer, speakers: UnsafeMutableAudioBufferListPointer) {
+        audioCycleCount.add(1, ordering: .relaxed)
         let targetMultiplier = volume.currentTargetVolumeMultiplier
         let startMultiplier = Float(bitPattern: appliedVolumeMultiplier.load(ordering: .relaxed))
+        let fadeGoal = Float(bitPattern: fadeTarget.load(ordering: .relaxed))
+        let fadeStep = Float(bitPattern: fadeStepPerFrame.load(ordering: .relaxed))
+        let fadeStart = Float(bitPattern: fadeProgress.load(ordering: .relaxed))
+        let stereoPair = (left: leftSpeakerChannel.load(ordering: .relaxed), right: rightSpeakerChannel.load(ordering: .relaxed))
 
         var capturedChannelCount = 0
         for capturedBuffer in captured { capturedChannelCount += Int(capturedBuffer.mNumberChannels) }
+        var speakerChannelCount = 0
+        for speakerBuffer in speakers { speakerChannelCount += Int(speakerBuffer.mNumberChannels) }
 
+        var fadeAtEnd = fadeStart
+        var cycleHadSound = false
         var firstChannelOfThisBuffer = 0
         for speakerBuffer in speakers {
             let channelCount = Int(speakerBuffer.mNumberChannels)
@@ -49,17 +119,32 @@ final class TapAudioCopier: Sendable {
             guard channelCount > 0, let speakerSamples = speakerBuffer.mData?.assumingMemoryBound(to: Float.self) else { continue }
             let frameCount = Int(speakerBuffer.mDataByteSize) / (MemoryLayout<Float>.size * channelCount)
             let glideStepPerFrame = frameCount > 0 ? (targetMultiplier - startMultiplier) / Float(frameCount) : 0
+            var fade = fadeStart
             for frame in 0..<frameCount {
-                let multiplierAtThisFrame = startMultiplier + glideStepPerFrame * Float(frame + 1)
+                fade = fade < fadeGoal ? min(fade + fadeStep, fadeGoal) : max(fade - fadeStep, fadeGoal)
+                let gain = (startMultiplier + glideStepPerFrame * Float(frame + 1)) * equalPowerGain(fade)
+                let left = capturedChannelCount > 0 ? Self.sample(in: captured, channel: 0, frame: frame) : 0
+                let right = capturedChannelCount > 1 ? Self.sample(in: captured, channel: 1, frame: frame) : left
+                if left != 0 || right != 0 { cycleHadSound = true }
                 for channel in 0..<channelCount {
-                    let capturedSample = capturedChannelCount > 0
-                        ? Self.sample(in: captured, channel: (firstChannelOfThisBuffer + channel) % capturedChannelCount, frame: frame)
-                        : 0
-                    speakerSamples[frame * channelCount + channel] = capturedSample * multiplierAtThisFrame
+                    let source: Float = switch speakerFeed(channel: firstChannelOfThisBuffer + channel,
+                                                           speakerChannelCount: speakerChannelCount, stereoPair: stereoPair) {
+                    case .left: left
+                    case .right: right
+                    case .bothMixed: (left + right) * 0.5
+                    case .silent: 0
+                    }
+                    speakerSamples[frame * channelCount + channel] = source * gain
                 }
             }
+            fadeAtEnd = fade
         }
         appliedVolumeMultiplier.store(targetMultiplier.bitPattern, ordering: .relaxed)
+        fadeProgress.store(fadeAtEnd.bitPattern, ordering: .relaxed)
+        if cycleHadSound {
+            heardSound.store(true, ordering: .relaxed)
+            lastSoundAtNanoseconds.store(clock_gettime_nsec_np(CLOCK_UPTIME_RAW), ordering: .relaxed)
+        }
     }
 
     /// Runs on the real-time audio thread. Finds one sample by overall channel number, whatever the buffer layout.
@@ -96,21 +181,192 @@ struct TapSetupError: Error, CustomStringConvertible {
     var description: String { "\(failedStep) failed (\(readableStatus(status)))" }
 }
 
-/// Per-app volume for one app. Three Core Audio pieces, created in order and destroyed in reverse:
-/// 1. a process tap: captures the app's audio and silences its normal output;
-/// 2. a private device: the tap as input, the real speakers or headphones as output (invisible to other apps);
-/// 3. an audio callback on that device: copies input to output with the app's volume applied.
+/// Where a private device sends its sound: the sub-devices to list and the one that keeps time. A Multi-Output or other
+/// aggregate device the user made is unpacked into its own sub-devices, because a private device holding another
+/// aggregate device plays silence (FineTune #186). Any other device is used as it is.
+struct SpeakerLayout {
+    let subDevices: [[String: Any]]
+    let mainSubDevice: String
+    let isStacked: Bool
+
+    var isSingleDevice: Bool { subDevices.count == 1 && !isStacked }
+
+    static func plain(_ persistentID: String) -> SpeakerLayout {
+        SpeakerLayout(subDevices: [[kAudioSubDeviceUIDKey: persistentID]], mainSubDevice: persistentID, isStacked: false)
+    }
+
+    static func of(_ persistentID: String) -> SpeakerLayout {
+        let device = deviceID(forPersistentID: persistentID)
+        guard readProperty(kAudioDevicePropertyTransportType, of: device, orDefault: UInt32(0)) == kAudioDeviceTransportTypeAggregate,
+              let composition = readDictionaryProperty(kAudioAggregateDevicePropertyComposition, of: device),
+              let subDevices = composition[kAudioAggregateDeviceSubDeviceListKey] as? [[String: Any]], !subDevices.isEmpty,
+              let main = composition[kAudioAggregateDeviceMainSubDeviceKey] as? String
+                ?? subDevices.first?[kAudioSubDeviceUIDKey] as? String
+        else { return .plain(persistentID) }
+        return SpeakerLayout(subDevices: subDevices, mainSubDevice: main,
+                             isStacked: (composition[kAudioAggregateDeviceIsStackedKey] as? NSNumber)?.boolValue ?? false)
+    }
+}
+
+/// The device's stereo pair (Audio MIDI Setup, "Configure Speakers"), 0-based; the first two channels if it reports none.
+func stereoPair(ofOutput persistentID: String) -> (left: Int, right: Int) {
+    let pair = readPropertyList(kAudioDevicePropertyPreferredChannelsForStereo, of: deviceID(forPersistentID: persistentID),
+                                scope: kAudioObjectPropertyScopeOutput, elementType: UInt32.self)
+    guard pair.count == 2, pair[0] >= 1, pair[1] >= 1 else { return (0, 1) }
+    return (Int(pair[0]) - 1, Int(pair[1]) - 1)
+}
+
+/// One private device: the app's tap as input, real speakers or headphones as output, and the audio callback between
+/// them. An app normally has one; a crossfade runs a second on the new speakers for a moment.
 /// Used only on TapController's queue.
-final class AppVolumeTap {
-    /// The speakers or headphones this tap plays to.
+final class SpeakerPath {
+    /// The speakers or headphones this path plays to.
     private(set) var outputDevicePersistentID: String
-    private let tapDescription: CATapDescription
-    private var processTapID = AudioObjectID(kAudioObjectUnknown)
+    let copier: TapAudioCopier
     private var privateDeviceID = AudioObjectID(kAudioObjectUnknown)
     private var audioCallbackID: AudioDeviceIOProcID?
 
-    init(appID: String, target: TapTarget, realtimeState: RealtimeVolumeState, outputDevicePersistentID: String) throws {
+    init(appID: String, tapUUID: String, realtimeState: RealtimeVolumeState, outputDevicePersistentID: String,
+         fadedIn: Bool) throws {
         self.outputDevicePersistentID = outputDevicePersistentID
+        copier = TapAudioCopier(volume: realtimeState, fadedIn: fadedIn)
+        do {
+            let layout = SpeakerLayout.of(outputDevicePersistentID)
+            var status = createPrivateDevice(appID: appID, tapUUID: tapUUID, layout: layout)
+            if status != noErr, !layout.isSingleDevice {
+                // ponytail: unpacking a user's aggregate device is unverified with a tap inside; if Core Audio refuses it,
+                // use the device as it is, as before.
+                earSaxLog.error("Unpacking \(outputDevicePersistentID) failed (\(readableStatus(status))); using it as it is")
+                status = createPrivateDevice(appID: appID, tapUUID: tapUUID, layout: .plain(outputDevicePersistentID))
+            }
+            guard status == noErr else { throw TapSetupError(failedStep: "Creating the private output", status: status) }
+            useSmallAudioBuffer()
+            copier.useStereoPair(stereoPair(ofOutput: outputDevicePersistentID))
+
+            status = AudioDeviceCreateIOProcIDWithBlock(&audioCallbackID, privateDeviceID, nil, Self.makeRealtimeAudioCallback(copier))
+            guard status == noErr else { throw TapSetupError(failedStep: "Registering the audio callback", status: status) }
+
+            status = AudioDeviceStart(privateDeviceID, audioCallbackID)
+            guard status == noErr else { throw TapSetupError(failedStep: "Starting the audio", status: status) }
+        } catch {
+            stop()
+            throw error
+        }
+    }
+
+    private func createPrivateDevice(appID: String, tapUUID: String, layout: SpeakerLayout) -> OSStatus {
+        let privateDeviceSettings: [String: Any] = [
+            kAudioAggregateDeviceNameKey: "EarSax \(appID)",
+            kAudioAggregateDeviceUIDKey: earSaxPrivateDevicePrefix + UUID().uuidString,
+            kAudioAggregateDeviceMainSubDeviceKey: layout.mainSubDevice,
+            kAudioAggregateDeviceIsPrivateKey: true,
+            kAudioAggregateDeviceIsStackedKey: layout.isStacked,
+            kAudioAggregateDeviceTapAutoStartKey: true,
+            kAudioAggregateDeviceSubDeviceListKey: layout.subDevices,
+            kAudioAggregateDeviceTapListKey: [[kAudioSubTapUIDKey: tapUUID, kAudioSubTapDriftCompensationKey: true]],
+        ]
+        return AudioHardwareCreateAggregateDevice(privateDeviceSettings as CFDictionary, &privateDeviceID)
+    }
+
+    /// Asks the private device for small audio buffers, which set the delay EarSax adds: two buffers from capture to playback.
+    /// Measured on Bluetooth earbuds (in the callback): 23.2 ms at the default 512 frames, still a visible lag on video;
+    /// 11.6 ms at 256 frames, no visible lag and no crackles. Clamped to what the device allows; if it refuses, the
+    /// default stays. ponytail: a fixed size; if some device crackles at 256, raise it for that device.
+    /// Also re-run after a quick move, because the new speakers may allow other sizes (code review, finding 1).
+    private func useSmallAudioBuffer() {
+        let allowed = readProperty(kAudioDevicePropertyBufferFrameSizeRange, of: privateDeviceID,
+                                   orDefault: AudioValueRange(mMinimum: 0, mMaximum: 0))
+        guard let frames = smallBufferFrames(sampleRate: sampleRate, allowed: allowed) else { return }
+        let status = writeProperty(kAudioDevicePropertyBufferFrameSize, of: privateDeviceID, value: frames)
+        if status != noErr { earSaxLog.error("Couldn't set a \(frames)-frame buffer (\(readableStatus(status))); keeping the default") }
+    }
+
+    /// Built outside any actor on purpose: Swift 6 crashes (EXC_BREAKPOINT) when Core Audio calls a main-actor closure on
+    /// its real-time thread (Phase 0 crash, 2026-11-16).
+    private static func makeRealtimeAudioCallback(_ copier: TapAudioCopier) -> AudioDeviceIOBlock {
+        { @Sendable _, capturedAudio, _, speakerAudio, _ in
+            copier.copyAppAudioToSpeakers(
+                captured: UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: capturedAudio)),
+                speakers: UnsafeMutableAudioBufferListPointer(speakerAudio))
+        }
+    }
+
+    /// The quick move, now the fallback when a crossfade can't run: changes this private device's speakers in place, one
+    /// short gap. The tap (which keeps the app silenced) is untouched.
+    /// Returns Core Audio's status; on failure the caller rebuilds the tap instead.
+    func moveOutput(toDevice newOutputDevicePersistentID: String, sampleRate newSampleRate: Float64) -> OSStatus {
+        // A user's aggregate device needs its sub-devices unpacked, which only a new private device does.
+        guard SpeakerLayout.of(newOutputDevicePersistentID).isSingleDevice else { return kAudioHardwareUnsupportedOperationError }
+        let speakersStatus = writeProperty(kAudioAggregateDevicePropertyFullSubDeviceList, of: privateDeviceID,
+                                           value: [newOutputDevicePersistentID] as CFArray)
+        guard speakersStatus == noErr else { return speakersStatus }
+        // The speakers list decides where the sound goes, so record the new device now: if the next step fails, the rebuild
+        // then knows it's on the same device and pauses this tap first, instead of playing doubled sound (code review, finding 3).
+        outputDevicePersistentID = newOutputDevicePersistentID
+        let mainStatus = writeProperty(kAudioAggregateDevicePropertyMainSubDevice, of: privateDeviceID,
+                                       value: newOutputDevicePersistentID as CFString)
+        guard mainStatus == noErr else { return mainStatus }
+        // New speakers at another rate (Bluetooth earbuds at 44.1 kHz, desk speakers at 48 kHz): the private device follows
+        // them, and the tap's sound is resampled to it (listening test, 2026-11-16).
+        if abs(sampleRate - newSampleRate) >= 1 {
+            let rateStatus = writeProperty(kAudioDevicePropertyNominalSampleRate, of: privateDeviceID, value: newSampleRate)
+            guard rateStatus == noErr else { return rateStatus }
+            // The write is only a request; Core Audio applies it a moment later. Wait for it, or the caller rebuilds the tap
+            // (code review of the cross-rate move, finding 1).
+            // ponytail: polls on the tap queue for at most 250 ms; a listener on the rate if that ever shows up as a delay.
+            let deadline = ContinuousClock.now + .milliseconds(250)
+            while abs(sampleRate - newSampleRate) >= 1 {
+                guard ContinuousClock.now < deadline else { return kAudioHardwareUnspecifiedError }
+                Thread.sleep(forTimeInterval: 0.005)
+            }
+        }
+        useSmallAudioBuffer()
+        copier.useStereoPair(stereoPair(ofOutput: newOutputDevicePersistentID))
+        return noErr
+    }
+
+    /// The rate the private device runs at.
+    var sampleRate: Float64 {
+        readProperty(kAudioDevicePropertyNominalSampleRate, of: privateDeviceID, orDefault: Float64(0))
+    }
+
+    /// Stops this path's sound; the tap keeps the app silenced.
+    func pauseAudio() {
+        if privateDeviceID != kAudioObjectUnknown, let audioCallbackID { AudioDeviceStop(privateDeviceID, audioCallbackID) }
+    }
+
+    func stop() {
+        if privateDeviceID != kAudioObjectUnknown {
+            if let audioCallbackID {
+                AudioDeviceStop(privateDeviceID, audioCallbackID)
+                AudioDeviceDestroyIOProcID(privateDeviceID, audioCallbackID)
+            }
+            AudioHardwareDestroyAggregateDevice(privateDeviceID)
+        }
+        audioCallbackID = nil
+        privateDeviceID = AudioObjectID(kAudioObjectUnknown)
+    }
+}
+
+/// Per-app volume for one app: a process tap, which captures the app's audio and silences its normal output, and the
+/// speaker path that plays it (two for a moment during a crossfade). Created in that order, destroyed in reverse.
+/// Used only on TapController's queue.
+final class AppVolumeTap {
+    private let appID: String
+    private let realtimeState: RealtimeVolumeState
+    private let tapDescription: CATapDescription
+    private var processTapID = AudioObjectID(kAudioObjectUnknown)
+    private var speakers: SpeakerPath?
+    /// The new speakers during a crossfade, silent until the fade starts.
+    private var incomingSpeakers: SpeakerPath?
+
+    /// The speakers or headphones this tap plays to.
+    var outputDevicePersistentID: String { speakers?.outputDevicePersistentID ?? "" }
+    var incomingOutputDevicePersistentID: String? { incomingSpeakers?.outputDevicePersistentID }
+
+    init(appID: String, target: TapTarget, realtimeState: RealtimeVolumeState, outputDevicePersistentID: String) throws {
+        self.appID = appID
+        self.realtimeState = realtimeState
         switch target {
         case .bundleIDs(let bundleIDs):
             tapDescription = CATapDescription(stereoMixdownOfProcesses: [])
@@ -127,61 +383,14 @@ final class AppVolumeTap {
         // gives the app its normal sound back (re-verified by force-quit test).
         tapDescription.muteBehavior = .muted
         tapDescription.isPrivate = true
+        let status = AudioHardwareCreateProcessTap(tapDescription, &processTapID)
+        guard status == noErr else { throw TapSetupError(failedStep: "Creating the audio tap", status: status) }
         do {
-            try start(appID: appID, realtimeState: realtimeState, outputDevicePersistentID: outputDevicePersistentID)
+            speakers = try SpeakerPath(appID: appID, tapUUID: tapDescription.uuid.uuidString, realtimeState: realtimeState,
+                                       outputDevicePersistentID: outputDevicePersistentID, fadedIn: true)
         } catch {
             stop()
             throw error
-        }
-    }
-
-    private func start(appID: String, realtimeState: RealtimeVolumeState, outputDevicePersistentID: String) throws {
-        var status = AudioHardwareCreateProcessTap(tapDescription, &processTapID)
-        guard status == noErr else { throw TapSetupError(failedStep: "Creating the audio tap", status: status) }
-
-        let privateDeviceSettings: [String: Any] = [
-            kAudioAggregateDeviceNameKey: "EarSax \(appID)",
-            kAudioAggregateDeviceUIDKey: earSaxPrivateDevicePrefix + UUID().uuidString,
-            kAudioAggregateDeviceMainSubDeviceKey: outputDevicePersistentID,
-            kAudioAggregateDeviceIsPrivateKey: true,
-            kAudioAggregateDeviceIsStackedKey: false,
-            kAudioAggregateDeviceTapAutoStartKey: true,
-            kAudioAggregateDeviceSubDeviceListKey: [[kAudioSubDeviceUIDKey: outputDevicePersistentID]],
-            kAudioAggregateDeviceTapListKey: [[kAudioSubTapUIDKey: tapDescription.uuid.uuidString,
-                                               kAudioSubTapDriftCompensationKey: true]],
-        ]
-        status = AudioHardwareCreateAggregateDevice(privateDeviceSettings as CFDictionary, &privateDeviceID)
-        guard status == noErr else { throw TapSetupError(failedStep: "Creating the private output", status: status) }
-        useSmallAudioBuffer()
-
-        status = AudioDeviceCreateIOProcIDWithBlock(&audioCallbackID, privateDeviceID, nil, Self.makeRealtimeAudioCallback(TapAudioCopier(volume: realtimeState)))
-        guard status == noErr else { throw TapSetupError(failedStep: "Registering the audio callback", status: status) }
-
-        status = AudioDeviceStart(privateDeviceID, audioCallbackID)
-        guard status == noErr else { throw TapSetupError(failedStep: "Starting the audio", status: status) }
-    }
-
-    /// Asks the private device for small audio buffers, which set the delay EarSax adds: two buffers from capture to playback.
-    /// Measured on Bluetooth earbuds (in the callback): 23.2 ms at the default 512 frames, still a visible lag on video;
-    /// 11.6 ms at 256 frames, no visible lag and no crackles. Clamped to what the device allows; if it refuses, the
-    /// default stays. ponytail: a fixed size; if some device crackles at 256, raise it for that device.
-    /// Also re-run after a quick move, because the new speakers may allow other sizes (code review, finding 1).
-    private func useSmallAudioBuffer() {
-        let sampleRate = readProperty(kAudioDevicePropertyNominalSampleRate, of: privateDeviceID, orDefault: Float64(0))
-        let allowed = readProperty(kAudioDevicePropertyBufferFrameSizeRange, of: privateDeviceID,
-                                   orDefault: AudioValueRange(mMinimum: 0, mMaximum: 0))
-        guard let frames = smallBufferFrames(sampleRate: sampleRate, allowed: allowed) else { return }
-        let status = writeProperty(kAudioDevicePropertyBufferFrameSize, of: privateDeviceID, value: frames)
-        if status != noErr { earSaxLog.error("Couldn't set a \(frames)-frame buffer (\(readableStatus(status))); keeping the default") }
-    }
-
-    /// Built outside any actor on purpose: Swift 6 crashes (EXC_BREAKPOINT) when Core Audio calls a main-actor closure on
-    /// its real-time thread (Phase 0 crash, 2026-11-16).
-    private static func makeRealtimeAudioCallback(_ copier: TapAudioCopier) -> AudioDeviceIOBlock {
-        { @Sendable _, capturedAudio, _, speakerAudio, _ in
-            copier.copyAppAudioToSpeakers(
-                captured: UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: capturedAudio)),
-                speakers: UnsafeMutableAudioBufferListPointer(speakerAudio))
         }
     }
 
@@ -201,60 +410,62 @@ final class AppVolumeTap {
         return status == noErr
     }
 
-    /// Sends this tap's sound to another output by changing its private device's speakers in place. The tap itself (which
-    /// keeps the app silenced) is untouched, so a switch costs one short gap instead of rebuilding the whole tap, which took
-    /// 0.5 to 1 s per app and left the old speakers playing meanwhile.
-    /// Returns Core Audio's status; on failure the caller rebuilds the tap instead.
     func moveOutput(toDevice newOutputDevicePersistentID: String, sampleRate newSampleRate: Float64) -> OSStatus {
-        let speakersStatus = writeProperty(kAudioAggregateDevicePropertyFullSubDeviceList, of: privateDeviceID,
-                                           value: [newOutputDevicePersistentID] as CFArray)
-        guard speakersStatus == noErr else { return speakersStatus }
-        // The speakers list decides where the sound goes, so record the new device now: if the next step fails, the rebuild
-        // then knows it's on the same device and pauses this tap first, instead of playing doubled sound (code review, finding 3).
-        outputDevicePersistentID = newOutputDevicePersistentID
-        let mainStatus = writeProperty(kAudioAggregateDevicePropertyMainSubDevice, of: privateDeviceID,
-                                       value: newOutputDevicePersistentID as CFString)
-        guard mainStatus == noErr else { return mainStatus }
-        // New speakers at another rate (Bluetooth earbuds at 44.1 kHz, desk speakers at 48 kHz): the private device follows
-        // them, and the tap's sound is resampled to it, as it already is for an app on a device of its own. Before, any rate
-        // difference rebuilt the tap, which left the old speakers playing for about a second (listening test, 2026-11-16).
-        if abs(sampleRate - newSampleRate) >= 1 {
-            let rateStatus = writeProperty(kAudioDevicePropertyNominalSampleRate, of: privateDeviceID, value: newSampleRate)
-            guard rateStatus == noErr else { return rateStatus }
-            // The write is only a request; Core Audio applies it a moment later. Wait for it, or the caller rebuilds the tap
-            // (code review of the cross-rate move, finding 1).
-            // ponytail: polls on the tap queue for at most 250 ms; a listener on the rate if that ever shows up as a delay.
-            let deadline = ContinuousClock.now + .milliseconds(250)
-            while abs(sampleRate - newSampleRate) >= 1 {
-                guard ContinuousClock.now < deadline else { return kAudioHardwareUnspecifiedError }
-                Thread.sleep(forTimeInterval: 0.005)
-            }
-        }
-        useSmallAudioBuffer()
-        return noErr
+        speakers?.moveOutput(toDevice: newOutputDevicePersistentID, sampleRate: newSampleRate) ?? kAudioHardwareNotRunningError
     }
 
-    /// The rate the private device runs at.
-    var sampleRate: Float64 {
-        readProperty(kAudioDevicePropertyNominalSampleRate, of: privateDeviceID, orDefault: Float64(0))
+    var sampleRate: Float64 { speakers?.sampleRate ?? 0 }
+
+    // MARK: Crossfade (ruling R29)
+
+    /// Step 1: a second private device on the new speakers, fed by the same tap, silent. The old one keeps playing.
+    func startCrossfade(toDevice newOutputDevicePersistentID: String) throws {
+        cancelCrossfade()
+        incomingSpeakers = try SpeakerPath(appID: appID, tapUUID: tapDescription.uuid.uuidString, realtimeState: realtimeState,
+                                           outputDevicePersistentID: newOutputDevicePersistentID, fadedIn: false)
+    }
+
+    /// The new device's callback has run: it is playing (silence, until the fade).
+    var incomingIsRunning: Bool { incomingSpeakers?.copier.hasRunAudioCycle ?? false }
+    var incomingHasHeardSound: Bool { incomingSpeakers?.copier.hasHeardSound ?? false }
+    /// The app played something on the old speakers just now, so a fade is worth waiting for.
+    func isPlaying(within window: Duration) -> Bool { speakers?.copier.heardSound(within: window) ?? false }
+
+    /// Step 2: the old speakers fade out while the new ones fade in.
+    func fadeToIncoming(over duration: Duration) {
+        guard let speakers, let incomingSpeakers else { return }
+        let fadeSeconds = seconds(duration)
+        speakers.copier.startFade(to: 0, overFrames: fadeSeconds * speakers.sampleRate)
+        if incomingSpeakers.copier.hasRunAudioCycle {
+            incomingSpeakers.copier.startFade(to: 1, overFrames: fadeSeconds * incomingSpeakers.sampleRate)
+        } else {
+            incomingSpeakers.copier.jumpFade(to: 1)   // not running (silent app): nothing would move its fade
+        }
+    }
+
+    /// Step 3: the old private device goes; the new one is now the tap's speakers.
+    func finishCrossfade() {
+        guard let incomingSpeakers else { return }
+        speakers?.stop()
+        speakers = incomingSpeakers
+        self.incomingSpeakers = nil
+    }
+
+    func cancelCrossfade() {
+        incomingSpeakers?.stop()
+        incomingSpeakers = nil
     }
 
     /// Stops this tap's sound but keeps the tap, so its app stays silenced. Used just before a replacement on the same device.
     func pauseAudio() {
-        if privateDeviceID != kAudioObjectUnknown, let audioCallbackID { AudioDeviceStop(privateDeviceID, audioCallbackID) }
+        speakers?.pauseAudio()
     }
 
     func stop() {
-        if privateDeviceID != kAudioObjectUnknown {
-            if let audioCallbackID {
-                AudioDeviceStop(privateDeviceID, audioCallbackID)
-                AudioDeviceDestroyIOProcID(privateDeviceID, audioCallbackID)
-            }
-            AudioHardwareDestroyAggregateDevice(privateDeviceID)
-        }
+        cancelCrossfade()
+        speakers?.stop()
+        speakers = nil
         if processTapID != kAudioObjectUnknown { AudioHardwareDestroyProcessTap(processTapID) }
-        audioCallbackID = nil
-        privateDeviceID = AudioObjectID(kAudioObjectUnknown)
         processTapID = AudioObjectID(kAudioObjectUnknown)
     }
 }
@@ -291,7 +502,7 @@ final class TapController: @unchecked Sendable {
     func ensureTap(appID: String, target: TapTarget, realtimeState: RealtimeVolumeState,
                    outputDevicePersistentID: String, reportProblem: @escaping ProblemReport) {
         tapQueue.async { [self] in
-            moveTapIfNeeded(appID: appID, toOutputDevice: outputDevicePersistentID)
+            moveTapsIfNeeded([appID: outputDevicePersistentID])
             if let existing = tapsByApp[appID] {
                 if existing.target == target { return }
                 // A helper that stopped playing leaves its bundle ID in the tap; that's harmless and avoids a dropout (finding 5).
@@ -329,10 +540,10 @@ final class TapController: @unchecked Sendable {
         }
     }
 
-    /// Plays `appID`'s tap on another output: the main output changed, or the app got its own device. Nothing happens when
-    /// the app has no tap or already plays there, so it can be called on every refresh.
-    func moveTap(appID: String, toOutputDevice outputDevicePersistentID: String) {
-        tapQueue.async { [self] in moveTapIfNeeded(appID: appID, toOutputDevice: outputDevicePersistentID) }
+    /// Plays each app's tap on the output given for it: the main output changed, or an app got its own device. Apps with no
+    /// tap or already there are skipped, so it can be called on every refresh. All moves crossfade together.
+    func moveTaps(_ outputByApp: [String: String]) {
+        tapQueue.async { [self] in moveTapsIfNeeded(outputByApp) }
     }
 
     /// Rebuilds the taps that match, each on the device it already plays on, because a sample rate changed (Bluetooth
@@ -396,12 +607,82 @@ final class TapController: @unchecked Sendable {
         }
     }
 
-    /// Runs on the tap queue.
-    private func moveTapIfNeeded(appID: String, toOutputDevice outputDevicePersistentID: String) {
-        guard let active = tapsByApp[appID], active.tap.outputDevicePersistentID != outputDevicePersistentID else { return }
-        // A quick move whenever the old output still exists, at any sample rate (the move sets the new rate). A device that
-        // just disappeared, or a refused move, rebuilds the tap (code review, findings 1 and 2).
+    /// Crossfade timing (ruling R29): how long a new device runs silently before the fade, then the fade itself. The warm-up
+    /// covers the moment a device takes to really sound after it starts; Bluetooth takes longer (FineTune uses the same
+    /// figures).
+    private static let wiredWarmUp = Duration.milliseconds(50)
+    private static let bluetoothWarmUp = Duration.milliseconds(300)
+    private static let fadeLength = Duration.milliseconds(50)
+    /// An app that played nothing for this long counts as silent: no fade to wait for.
+    private static let recentSound = Duration.milliseconds(500)
+
+    /// Runs on the tap queue. Every move is a crossfade: a second private device on the new speakers, a short warm-up, then
+    /// the old speakers fade out while the new ones fade in, so no silence is heard. All the apps moving at once share one
+    /// warm-up. A device that just disappeared, or a crossfade that can't start, falls back to the quick move and then a
+    /// rebuild, as before.
+    private func moveTapsIfNeeded(_ outputByApp: [String: String]) {
         let movedAt = ContinuousClock.now
+        var crossfading: [(appID: String, active: ActiveTap)] = []
+        for (appID, newOutput) in outputByApp {
+            guard let active = tapsByApp[appID], active.tap.outputDevicePersistentID != newOutput else { continue }
+            let bothConnected = deviceID(forPersistentID: active.tap.outputDevicePersistentID) != kAudioObjectUnknown
+                && deviceID(forPersistentID: newOutput) != kAudioObjectUnknown
+            guard bothConnected else {
+                quickMoveOrRebuild(appID: appID, active: active, toOutputDevice: newOutput, movedAt: movedAt)
+                continue
+            }
+            do {
+                try active.tap.startCrossfade(toDevice: newOutput)
+                crossfading.append((appID, active))
+            } catch {
+                earSaxLog.error("Crossfade for \(appID) couldn't start: \(String(describing: error)); moving it directly")
+                quickMoveOrRebuild(appID: appID, active: active, toOutputDevice: newOutput, movedAt: movedAt)
+            }
+        }
+        guard !crossfading.isEmpty else { return }
+
+        // Wait for each new device to run. A silent app's new device may never start (it waits for the app's sound), so an
+        // app that played nothing just now doesn't hold the others up.
+        let deadline = ContinuousClock.now + .seconds(1)
+        while ContinuousClock.now < deadline,
+              !crossfading.allSatisfy({ $0.active.tap.incomingIsRunning || !$0.active.tap.isPlaying(within: Self.recentSound) }) {
+            Thread.sleep(forTimeInterval: 0.005)
+        }
+        let anyBluetooth = crossfading.contains { isBluetoothDevice($0.active.tap.incomingOutputDevicePersistentID ?? "") }
+        Thread.sleep(forTimeInterval: seconds(anyBluetooth ? Self.bluetoothWarmUp : Self.wiredWarmUp))
+
+        var fading: [(appID: String, active: ActiveTap)] = []
+        for (appID, active) in crossfading {
+            let tap = active.tap
+            if tap.isPlaying(within: Self.recentSound), tap.incomingIsRunning, !tap.incomingHasHeardSound {
+                // Both private devices read the same tap. If the new one gets only silence while the old one still gets
+                // sound, sharing the tap doesn't work here: fall back rather than fade into silence.
+                let newOutput = tap.incomingOutputDevicePersistentID ?? ""
+                earSaxLog.error("Crossfade for \(appID): the new device got no sound from the tap; moving it directly")
+                tap.cancelCrossfade()
+                quickMoveOrRebuild(appID: appID, active: active, toOutputDevice: newOutput, movedAt: movedAt)
+                continue
+            }
+            tap.fadeToIncoming(over: Self.fadeLength)
+            fading.append((appID, active))
+        }
+        Thread.sleep(forTimeInterval: seconds(Self.fadeLength) + 0.02)   // the fade, plus one audio cycle to finish it
+        for (appID, active) in fading {
+            let newOutput = active.tap.incomingOutputDevicePersistentID ?? ""
+            let wasPlaying = active.tap.isPlaying(within: Self.recentSound)
+            active.tap.finishCrossfade()
+            // Counts as built at the start of the move, so a sample-rate notice from before it doesn't rebuild it (code review
+            // of the cross-rate move, finding 5).
+            tapsByApp[appID] = ActiveTap(tap: active.tap, target: active.target, realtimeState: active.realtimeState,
+                                         reportProblem: active.reportProblem, builtAt: movedAt)
+            earSaxLog.notice("Crossfaded \(appID) to \(newOutput) in \(milliseconds(since: movedAt)) ms\(wasPlaying ? "" : " (silent, no fade)")")
+        }
+    }
+
+    /// Runs on the tap queue. The move from before crossfades: the private device's speakers changed in place (one short
+    /// gap), or the whole tap rebuilt when that fails or the old device is gone.
+    private func quickMoveOrRebuild(appID: String, active: ActiveTap, toOutputDevice outputDevicePersistentID: String,
+                                    movedAt: ContinuousClock.Instant) {
         let previousOutputStillConnected = deviceID(forPersistentID: active.tap.outputDevicePersistentID) != kAudioObjectUnknown
         let newSampleRate = readProperty(kAudioDevicePropertyNominalSampleRate,
                                          of: deviceID(forPersistentID: outputDevicePersistentID), orDefault: Float64(0))
@@ -409,14 +690,10 @@ final class TapController: @unchecked Sendable {
             let previousSampleRate = active.tap.sampleRate
             let startedAt = ContinuousClock.now
             let status = active.tap.moveOutput(toDevice: outputDevicePersistentID, sampleRate: newSampleRate)
-            let elapsed = (ContinuousClock.now - startedAt).components
-            let milliseconds = elapsed.seconds * 1000 + elapsed.attoseconds / 1_000_000_000_000_000
             if status == noErr {
                 // The rates in the log let QA tell a cross-rate move from a same-rate one.
                 let rates = abs(previousSampleRate - newSampleRate) >= 1 ? ", \(Int(previousSampleRate)) to \(Int(newSampleRate)) Hz" : ""
-                earSaxLog.notice("Moved \(appID) to \(outputDevicePersistentID) in \(milliseconds) ms\(rates)")
-                // Counts as built now, so a sample-rate notice from before the move doesn't rebuild it (code review of the
-                // cross-rate move, finding 5).
+                earSaxLog.notice("Moved \(appID) to \(outputDevicePersistentID) in \(milliseconds(since: startedAt)) ms\(rates)")
                 tapsByApp[appID] = ActiveTap(tap: active.tap, target: active.target, realtimeState: active.realtimeState,
                                              reportProblem: active.reportProblem, builtAt: movedAt)
                 return
@@ -484,4 +761,18 @@ final class TapController: @unchecked Sendable {
             if reportsFailure { reportProblem("\(error)") }
         }
     }
+}
+
+private func seconds(_ duration: Duration) -> TimeInterval {
+    Double(duration.components.seconds) + Double(duration.components.attoseconds) / 1e18
+}
+
+private func milliseconds(since start: ContinuousClock.Instant) -> Int64 {
+    let elapsed = (ContinuousClock.now - start).components
+    return elapsed.seconds * 1000 + elapsed.attoseconds / 1_000_000_000_000_000
+}
+
+private func isBluetoothDevice(_ persistentID: String) -> Bool {
+    let transport = readProperty(kAudioDevicePropertyTransportType, of: deviceID(forPersistentID: persistentID), orDefault: UInt32(0))
+    return transport == kAudioDeviceTransportTypeBluetooth || transport == kAudioDeviceTransportTypeBluetoothLE
 }

@@ -82,8 +82,27 @@ func identifyOwningApp(of process: ProcessUsingAudio) -> AppIdentity? {
     guard let app = NSRunningApplication(processIdentifier: ownerProcessID),
           app.activationPolicy != .prohibited,
           let bundleID = app.bundleIdentifier,
-          bundleID != Bundle.main.bundleIdentifier else { return nil }
-    return AppIdentity(bundleID: bundleID, name: app.localizedName ?? bundleID, bundleURL: app.bundleURL)
+          bundleID != Bundle.main.bundleIdentifier,
+          !isAppleBackgroundService(bundleURL: app.bundleURL, policy: app.activationPolicy) else { return nil }
+    return AppIdentity(bundleID: bundleID, name: visibleAppName(app.localizedName, bundleURL: app.bundleURL, bundleID: bundleID),
+                       bundleURL: app.bundleURL)
+}
+
+/// macOS's own helper apps without a Dock icon, such as MediaRemoteUIService on macOS 27, which uses audio and shows as a
+/// row with no name (FineTune #493). Not something to set a volume for.
+func isAppleBackgroundService(bundleURL: URL?, policy: NSApplication.ActivationPolicy) -> Bool {
+    policy != .regular && bundleURL?.path.hasPrefix("/System/Library/CoreServices/") == true
+}
+
+/// The app's name, unless it is empty or only invisible characters (MediaRemoteUIService's name is a single
+/// left-to-right mark); then the bundle's file name, then its ID.
+func visibleAppName(_ localizedName: String?, bundleURL: URL?, bundleID: String) -> String {
+    let isVisible: (String) -> Bool = { text in
+        text.unicodeScalars.contains { !$0.properties.isWhitespace && $0.properties.generalCategory != .format }
+    }
+    if let localizedName, isVisible(localizedName) { return localizedName }
+    if let fileName = bundleURL?.deletingPathExtension().lastPathComponent, isVisible(fileName) { return fileName }
+    return bundleID
 }
 
 // ponytail: a private macOS function, the only way to know which app a helper process works for (Chrome Helper → Chrome,

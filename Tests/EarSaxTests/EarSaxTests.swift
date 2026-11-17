@@ -351,3 +351,46 @@ private func runOneAudioCycle(_ copier: TapAudioCopier, frameCount: Int) -> [Flo
     #expect(microphoneToKeep(lastNonBluetoothInput: "BuiltInMicrophoneDevice", current: usb, justConnected: true, inputs: all) == nil)
     #expect(microphoneToKeep(lastNonBluetoothInput: nil, current: earbuds, justConnected: true, inputs: [earbuds]) == nil)
 }
+
+// MARK: - Phase 2 finishing: speaker channels, crossfade curve, app names
+
+@Test func stereoGoesToTheDevicesStereoPairOnly() {
+    // An 8-output interface whose stereo pair is outputs 3 and 4 (0-based 2 and 3): only those play (FineTune #105).
+    let feeds = (0..<8).map { speakerFeed(channel: $0, speakerChannelCount: 8, stereoPair: (left: 2, right: 3)) }
+    #expect(feeds == [.silent, .silent, .left, .right, .silent, .silent, .silent, .silent])
+}
+
+@Test func aMonoSpeakerGetsBothChannels() {
+    #expect(speakerFeed(channel: 0, speakerChannelCount: 1, stereoPair: (left: 0, right: 1)) == .bothMixed)
+}
+
+@Test func aStereoPairThatDoesntFitFallsBackToTheFirstTwo() {
+    let feeds = (0..<2).map { speakerFeed(channel: $0, speakerChannelCount: 2, stereoPair: (left: 4, right: 5)) }
+    #expect(feeds == [.left, .right])
+    #expect(speakerFeed(channel: 1, speakerChannelCount: 2, stereoPair: (left: 0, right: 0)) == .right)
+}
+
+@Test func theCrossfadeKeepsTheLevelSteady() {
+    // Old path at gain(1 - p), new at gain(p): their power adds to 1 all through the fade, so the level never dips.
+    for step in 0...20 {
+        let progress = Float(step) / 20
+        let power = equalPowerGain(1 - progress) * equalPowerGain(1 - progress) + equalPowerGain(progress) * equalPowerGain(progress)
+        #expect(abs(power - 1) < 0.0001)
+    }
+    #expect(equalPowerGain(0) == 0 && equalPowerGain(1) == 1)
+}
+
+@Test func anInvisibleAppNameFallsBackToSomethingReadable() {
+    // MediaRemoteUIService's name on macOS 27 is a single left-to-right mark (FineTune #493).
+    let url = URL(fileURLWithPath: "/System/Library/CoreServices/MediaRemoteUIService.app")
+    #expect(visibleAppName("\u{200E}", bundleURL: url, bundleID: "com.apple.MediaRemoteUIService") == "MediaRemoteUIService")
+    #expect(visibleAppName(" ", bundleURL: nil, bundleID: "com.example.app") == "com.example.app")
+    #expect(visibleAppName("Spotify", bundleURL: nil, bundleID: "com.spotify.client") == "Spotify")
+}
+
+@Test func applesBackgroundServicesAreNotApps() {
+    let service = URL(fileURLWithPath: "/System/Library/CoreServices/MediaRemoteUIService.app")
+    #expect(isAppleBackgroundService(bundleURL: service, policy: .accessory))
+    #expect(!isAppleBackgroundService(bundleURL: service, policy: .regular))
+    #expect(!isAppleBackgroundService(bundleURL: URL(fileURLWithPath: "/Applications/Menu Player.app"), policy: .accessory))
+}
