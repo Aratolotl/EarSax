@@ -14,6 +14,17 @@ final class MixerModel {
     private(set) var isOutputMuted = false
     /// False for devices whose volume macOS can set but not mute (some USB interfaces): the mute button is hidden.
     private(set) var canMuteOutputDevice = false
+    /// macOS's alert volume, 0...1 (ruling R30), or nil until read or if it can't be.
+    private(set) var alertVolume: Float?
+    /// Where macOS plays alert sounds (System Settings > Sound > "Play sound effects through"). EarSax never changes it
+    /// (ruling R32); the panel names it when it isn't the main output.
+    private(set) var alertDeviceID = AudioDeviceID(kAudioObjectUnknown)
+
+    /// The alert device's name, or nil when alerts play on the main output.
+    var alertDeviceNameIfElsewhere: String? {
+        guard alertDeviceID != kAudioObjectUnknown, alertDeviceID != currentOutputDeviceID else { return nil }
+        return outputDevices.first { $0.id == alertDeviceID }?.name
+    }
 
     // MARK: Input
 
@@ -102,6 +113,12 @@ final class MixerModel {
 
     /// Reads the current state and starts listening for changes. Call once at launch.
     func start() {
+        // The first alert-volume read loads macOS's scripting machinery, which blocks for about a second. Done once here,
+        // while the panel is closed, so opening the panel never waits for it.
+        Task { [weak self] in
+            try? await Task.sleep(for: .seconds(2))
+            self?.refreshAlertVolume()
+        }
         refreshOutputDevices()
         refreshInputDevices()
         refreshApps()
@@ -177,6 +194,17 @@ final class MixerModel {
         canMuteOutputDevice = canMuteOutput(of: currentOutputDeviceID)
     }
 
+    /// Read each time the panel opens, so a change made in System Settings shows; never polled while it's closed.
+    func refreshAlertVolume() {
+        alertVolume = readAlertVolume()
+        alertDeviceID = readProperty(kAudioHardwarePropertyDefaultSystemOutputDevice, of: coreAudioSystem,
+                                     orDefault: AudioDeviceID(kAudioObjectUnknown))
+    }
+
+    func setAlertVolume(_ volume: Float) {
+        if writeAlertVolume(volume) { alertVolume = volume }
+    }
+
     func refreshApps() {
         refreshPermission()
         let allApps = groupProcessesIntoApps(listProcessesUsingAudio(), identifyApp: identifyOwningApp)
@@ -186,6 +214,9 @@ final class MixerModel {
             guard let lastPlaying = lastPlayingTimeByApp[app.id] else { return false }
             return now - lastPlaying < Self.stillShownAfterStopping
         }
+        // Moves first, together, so a device that comes back (pinned apps) is one crossfade, not one per app (code review,
+        // finding 4). The call at the end covers taps this refresh creates.
+        moveTapsToTheirOutputs()
         for app in allApps { applySetting(to: app) }
         removeTapsOfAppsThatQuit(stillRunning: Set(allApps.map(\.id)))
         moveTapsToTheirOutputs()
@@ -414,10 +445,9 @@ final class MixerModel {
 
     /// Keeps every tap playing where its app should. Covers tapped apps that aren't running: their taps wait for them.
     private func moveTapsToTheirOutputs() {
-        for appID in tappedAppIDs {
-            guard let playsOnDevice = outputDevicePersistentID(for: appID) else { continue }
-            tapController.moveTap(appID: appID, toOutputDevice: playsOnDevice)
-        }
+        var outputByApp: [String: String] = [:]
+        for appID in tappedAppIDs { outputByApp[appID] = outputDevicePersistentID(for: appID) }
+        tapController.moveTaps(outputByApp)
     }
 
     // MARK: Default volume

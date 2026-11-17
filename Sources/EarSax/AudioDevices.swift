@@ -201,3 +201,24 @@ func canMuteOutput(of device: AudioDeviceID) -> Bool {
 func writeOutputMute(_ isMuted: Bool, to device: AudioDeviceID) {
     writeProperty(kAudioDevicePropertyMute, of: device, scope: kAudioObjectPropertyScopeOutput, value: UInt32(isMuted ? 1 : 0))
 }
+
+// MARK: - Alert sounds (ruling R30)
+
+/// macOS's alert volume (System Settings > Sound > Alert volume), 0...1, or nil if it can't be read. Core Audio has no
+/// property for it, so it goes through the scripting command AppleScript's `set volume alert volume` uses, run inside
+/// EarSax: no other app is involved and no permission is asked. The first call takes about a second (see MixerModel.start).
+@MainActor func readAlertVolume() -> Float? {
+    var error: NSDictionary?
+    guard let result = NSAppleScript(source: "alert volume of (get volume settings)")?.executeAndReturnError(&error),
+          error == nil else { return nil }
+    return Float(min(max(result.int32Value, 0), 100)) / 100
+}
+
+@MainActor func writeAlertVolume(_ volume: Float) -> Bool {
+    guard volume.isFinite else { return false }
+    var error: NSDictionary?
+    NSAppleScript(source: "set volume alert volume \(Int((min(max(volume, 0), 1) * 100).rounded()))")?.executeAndReturnError(&error)
+    if let error { earSaxLog.error("Couldn't set the alert volume: \(error)") }
+    return error == nil
+}
+
