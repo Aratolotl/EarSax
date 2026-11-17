@@ -359,7 +359,8 @@ final class SpeakerPath {
 }
 
 /// Per-app volume for one app: a process tap, which captures the app's audio and silences its normal output, and the
-/// speaker path that plays it (two for a moment during a crossfade). Created in that order, destroyed in reverse.
+/// speaker path that plays it. Created in that order, destroyed in reverse. A crossfade builds a second AppVolumeTap on the
+/// new speakers: two private devices sharing one tap went silent when the old one was removed (listening test, 2026-11-17).
 /// Used only on TapController's queue.
 final class AppVolumeTap {
     private let appID: String
@@ -367,14 +368,13 @@ final class AppVolumeTap {
     private let tapDescription: CATapDescription
     private var processTapID = AudioObjectID(kAudioObjectUnknown)
     private var speakers: SpeakerPath?
-    /// The new speakers during a crossfade, silent until the fade starts.
-    private var incomingSpeakers: SpeakerPath?
 
     /// The speakers or headphones this tap plays to.
     var outputDevicePersistentID: String { speakers?.outputDevicePersistentID ?? "" }
-    var incomingOutputDevicePersistentID: String? { incomingSpeakers?.outputDevicePersistentID }
 
-    init(appID: String, target: TapTarget, realtimeState: RealtimeVolumeState, outputDevicePersistentID: String) throws {
+    /// `fadedIn: false` starts it silent, for the new side of a crossfade.
+    init(appID: String, target: TapTarget, realtimeState: RealtimeVolumeState, outputDevicePersistentID: String,
+         fadedIn: Bool = true) throws {
         self.appID = appID
         self.realtimeState = realtimeState
         switch target {
@@ -397,7 +397,7 @@ final class AppVolumeTap {
         guard status == noErr else { throw TapSetupError(failedStep: "Creating the audio tap", status: status) }
         do {
             speakers = try SpeakerPath(appID: appID, tapUUID: tapDescription.uuid.uuidString, realtimeState: realtimeState,
-                                       outputDevicePersistentID: outputDevicePersistentID, fadedIn: true)
+                                       outputDevicePersistentID: outputDevicePersistentID, fadedIn: fadedIn)
         } catch {
             stop()
             throw error
@@ -428,47 +428,25 @@ final class AppVolumeTap {
 
     // MARK: Crossfade (ruling R29)
 
-    /// Step 1: a second private device on the new speakers, fed by the same tap, silent. The old one keeps playing.
-    func startCrossfade(toDevice newOutputDevicePersistentID: String) throws {
-        cancelCrossfade()
-        incomingSpeakers = try SpeakerPath(appID: appID, tapUUID: tapDescription.uuid.uuidString, realtimeState: realtimeState,
-                                           outputDevicePersistentID: newOutputDevicePersistentID, fadedIn: false)
-    }
-
-    /// The new device's callback has run: it is playing (silence, until the fade).
-    var incomingIsRunning: Bool { incomingSpeakers?.copier.hasRunAudioCycle ?? false }
-    var incomingHasHeardSound: Bool { incomingSpeakers?.copier.hasHeardSound ?? false }
-    /// The app played something on the old speakers just now, so a fade is worth waiting for.
+    /// The callback has run: the device is playing (silence, until a fade-in).
+    var isRunning: Bool { speakers?.copier.hasRunAudioCycle ?? false }
+    var hasHeardSound: Bool { speakers?.copier.hasHeardSound ?? false }
+    /// The app played something here just now.
     func isPlaying(within window: Duration) -> Bool { speakers?.copier.heardSound(within: window) ?? false }
+    var hasFadedOut: Bool { speakers?.copier.hasFadedOut ?? true }
 
-    /// Step 2: the new speakers fade in, then the old ones fade out (TapController times the two).
-    func fadeInIncoming(over duration: Duration) {
-        guard let incomingSpeakers else { return }
-        if incomingSpeakers.copier.hasRunAudioCycle {
-            incomingSpeakers.copier.startFade(to: 1, overFrames: seconds(duration) * incomingSpeakers.sampleRate)
+    func fadeIn(over duration: Duration) {
+        guard let speakers else { return }
+        if speakers.copier.hasRunAudioCycle {
+            speakers.copier.startFade(to: 1, overFrames: seconds(duration) * speakers.sampleRate)
         } else {
-            incomingSpeakers.copier.jumpFade(to: 1)   // not running: nothing would move its fade
+            speakers.copier.jumpFade(to: 1)   // not running: nothing would move its fade
         }
     }
 
-    func fadeOutOutgoing(over duration: Duration) {
+    func fadeOut(over duration: Duration) {
         guard let speakers else { return }
         speakers.copier.startFade(to: 0, overFrames: seconds(duration) * speakers.sampleRate)
-    }
-
-    var outgoingHasFadedOut: Bool { speakers?.copier.hasFadedOut ?? true }
-
-    /// Step 3: the old private device goes; the new one is now the tap's speakers.
-    func finishCrossfade() {
-        guard let incomingSpeakers else { return }
-        speakers?.stop()
-        speakers = incomingSpeakers
-        self.incomingSpeakers = nil
-    }
-
-    func cancelCrossfade() {
-        incomingSpeakers?.stop()
-        incomingSpeakers = nil
     }
 
     /// Stops this tap's sound but keeps the tap, so its app stays silenced. Used just before a replacement on the same device.
@@ -477,7 +455,6 @@ final class AppVolumeTap {
     }
 
     func stop() {
-        cancelCrossfade()
         speakers?.stop()
         speakers = nil
         if processTapID != kAudioObjectUnknown { AudioHardwareDestroyProcessTap(processTapID) }
@@ -637,7 +614,7 @@ final class TapController: @unchecked Sendable {
     /// rebuild, as before.
     private func moveTapsIfNeeded(_ outputByApp: [String: String]) {
         let movedAt = ContinuousClock.now
-        var crossfading: [(appID: String, active: ActiveTap)] = []
+        var crossfading: [(appID: String, active: ActiveTap, incoming: AppVolumeTap)] = []
         for (appID, newOutput) in outputByApp {
             guard let active = tapsByApp[appID], active.tap.outputDevicePersistentID != newOutput else { continue }
             let bothConnected = deviceID(forPersistentID: active.tap.outputDevicePersistentID) != kAudioObjectUnknown
@@ -650,8 +627,10 @@ final class TapController: @unchecked Sendable {
                 continue
             }
             do {
-                try active.tap.startCrossfade(toDevice: newOutput)
-                crossfading.append((appID, active))
+                // A tap of its own, silent: the old one keeps playing until the fade. Both keep the app's own output muted.
+                let incoming = try AppVolumeTap(appID: appID, target: active.target, realtimeState: active.realtimeState,
+                                                outputDevicePersistentID: newOutput, fadedIn: false)
+                crossfading.append((appID, active, incoming))
             } catch {
                 earSaxLog.error("Crossfade for \(appID) couldn't start: \(String(describing: error)); moving it directly")
                 quickMoveOrRebuild(appID: appID, active: active, toOutputDevice: newOutput, movedAt: movedAt)
@@ -661,49 +640,57 @@ final class TapController: @unchecked Sendable {
 
         // Wait for each new device to run, at most a second, then let it warm up.
         let deadline = ContinuousClock.now + .seconds(1)
-        while ContinuousClock.now < deadline, !crossfading.allSatisfy({ $0.active.tap.incomingIsRunning }) {
+        while ContinuousClock.now < deadline, !crossfading.allSatisfy({ $0.incoming.isRunning }) {
             Thread.sleep(forTimeInterval: 0.005)
         }
-        let anyBluetooth = crossfading.contains { isBluetoothDevice($0.active.tap.incomingOutputDevicePersistentID ?? "") }
+        let anyBluetooth = crossfading.contains { isBluetoothDevice($0.incoming.outputDevicePersistentID) }
         Thread.sleep(forTimeInterval: seconds(anyBluetooth ? Self.bluetoothWarmUp : Self.wiredWarmUp))
 
-        var fading: [(appID: String, active: ActiveTap, fadeOutDelay: TimeInterval)] = []
-        for (appID, active) in crossfading {
-            let tap = active.tap
-            let newOutput = tap.incomingOutputDevicePersistentID ?? ""
-            // Both private devices read the same tap. If the new one has had no sound while the app still plays (it never
-            // started, or sharing the tap doesn't work), fall back rather than fade into silence (code review, finding 1).
-            if tap.isPlaying(within: Self.recentSound), !tap.incomingHasHeardSound {
-                earSaxLog.error("Crossfade for \(appID): the new device got no sound from the tap; moving it directly")
-                tap.cancelCrossfade()
+        var fading: [(appID: String, active: ActiveTap, incoming: AppVolumeTap, fadeOutDelay: TimeInterval)] = []
+        for (appID, active, incoming) in crossfading {
+            let newOutput = incoming.outputDevicePersistentID
+            // If the new tap has had no sound while the app still plays, fall back rather than fade into silence (code
+            // review, finding 1).
+            if active.tap.isPlaying(within: Self.recentSound), !incoming.hasHeardSound {
+                earSaxLog.error("Crossfade for \(appID): the new tap got no sound; moving it directly")
+                incoming.stop()
                 quickMoveOrRebuild(appID: appID, active: active, toOutputDevice: newOutput, movedAt: movedAt)
                 continue
             }
             // A device with more output delay (Bluetooth) is heard later; the old one keeps playing that much longer, or the
             // gap comes back between them (code review, finding 2). Capped, in case a device reports nonsense.
-            let delayDifference = outputDelaySeconds(newOutput) - outputDelaySeconds(tap.outputDevicePersistentID)
-            fading.append((appID, active, min(max(delayDifference, 0), 0.5)))
+            let delayDifference = outputDelaySeconds(newOutput) - outputDelaySeconds(active.tap.outputDevicePersistentID)
+            fading.append((appID, active, incoming, min(max(delayDifference, 0), 0.5)))
         }
-        for (_, active, _) in fading { active.tap.fadeInIncoming(over: Self.fadeLength) }
+        for item in fading { item.incoming.fadeIn(over: Self.fadeLength) }
         var waited: TimeInterval = 0
-        for (_, active, fadeOutDelay) in fading.sorted(by: { $0.fadeOutDelay < $1.fadeOutDelay }) {
-            if fadeOutDelay > waited { Thread.sleep(forTimeInterval: fadeOutDelay - waited); waited = fadeOutDelay }
-            active.tap.fadeOutOutgoing(over: Self.fadeLength)
+        for item in fading.sorted(by: { $0.fadeOutDelay < $1.fadeOutDelay }) {
+            if item.fadeOutDelay > waited { Thread.sleep(forTimeInterval: item.fadeOutDelay - waited); waited = item.fadeOutDelay }
+            item.active.tap.fadeOut(over: Self.fadeLength)
         }
-        // The fades run in audio cycles; wait until every old path is silent (a device with large buffers takes longer),
-        // at most 300 ms past the fade (code review, finding 6).
+        // The fades run in audio cycles; wait until every old tap is silent (a device with large buffers takes longer), at
+        // most 300 ms past the fade (code review, finding 6).
         let fadeDeadline = ContinuousClock.now + Self.fadeLength + .milliseconds(300)
-        while ContinuousClock.now < fadeDeadline, !fading.allSatisfy({ $0.active.tap.outgoingHasFadedOut }) {
+        while ContinuousClock.now < fadeDeadline, !fading.allSatisfy({ $0.active.tap.hasFadedOut }) {
             Thread.sleep(forTimeInterval: 0.005)
         }
-        for (appID, active, fadeOutDelay) in fading {
-            let newOutput = active.tap.incomingOutputDevicePersistentID ?? ""
-            active.tap.finishCrossfade()
+        for item in fading {
+            item.active.tap.stop()
             // Counts as built at the start of the move, so a sample-rate notice from before it doesn't rebuild it (code review
             // of the cross-rate move, finding 5).
-            tapsByApp[appID] = ActiveTap(tap: active.tap, target: active.target, realtimeState: active.realtimeState,
-                                         reportProblem: active.reportProblem, builtAt: movedAt)
-            earSaxLog.notice("Crossfaded \(appID) to \(newOutput) in \(milliseconds(since: movedAt)) ms (old device kept \(Int(fadeOutDelay * 1000)) ms longer)")
+            tapsByApp[item.appID] = ActiveTap(tap: item.incoming, target: item.active.target, realtimeState: item.active.realtimeState,
+                                              reportProblem: item.active.reportProblem, builtAt: movedAt)
+            earSaxLog.notice("Crossfaded \(item.appID) to \(item.incoming.outputDevicePersistentID) in \(milliseconds(since: movedAt)) ms (old device kept \(Int(item.fadeOutDelay * 1000)) ms longer)")
+        }
+        // Safety net: an app that played before the switch must still play on the new tap once the old one is gone. If it
+        // doesn't, its tap is rebuilt, rather than leaving the app silent (listening test, 2026-11-17).
+        guard !fading.isEmpty else { return }
+        Thread.sleep(forTimeInterval: 0.2)
+        for item in fading where tapsByApp[item.appID]?.tap === item.incoming && !item.incoming.isPlaying(within: .milliseconds(150)) {
+            let active = tapsByApp[item.appID]!
+            replaceTap(appID: item.appID, oldTap: item.incoming, target: active.target, realtimeState: active.realtimeState,
+                       outputDevicePersistentID: item.incoming.outputDevicePersistentID, reportProblem: active.reportProblem,
+                       reason: "it went silent after the crossfade")
         }
     }
 
