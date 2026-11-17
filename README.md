@@ -51,7 +51,10 @@ Requires macOS 26 or later on a Mac with Apple silicon.
 - **One app elsewhere:** send a single app to another device, for now.
 - **Pins:** pin a device and that app always plays there while it's connected. It follows your main output while the device is away, and goes back when it returns.
 - **Low delay:** EarSax adds about 12 ms (measured on Bluetooth headphones).
-- **Sound input:** pick which microphone the Mac uses, from the row under the main volume.
+- **Sound input:** with more than one microphone, pick which one the Mac uses from the row under the main volume.
+
+### 🎙 Microphone
+- **Bluetooth headphones keep their full sound:** when they connect, macOS also hands them the microphone, which makes everything they play sound muffled while an app listens. EarSax switches back to the microphone you used before. You can still pick the headphones' microphone yourself, and the behavior can be turned off in Settings.
 
 ### ⚙️ Settings
 - **Default main volume:** when the output changes, a device that's too loud is turned down to your limit (75% to start). EarSax never turns a device up.
