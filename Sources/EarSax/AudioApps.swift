@@ -78,14 +78,28 @@ func listProcessesUsingAudio() -> [ProcessUsingAudio] {
 @MainActor
 func identifyOwningApp(of process: ProcessUsingAudio) -> AppIdentity? {
     guard process.processID != getpid() else { return nil }
-    let ownerProcessID = owningAppProcessID(of: process.processID) ?? process.processID
-    guard let app = NSRunningApplication(processIdentifier: ownerProcessID),
-          app.activationPolicy != .prohibited,
-          let bundleID = app.bundleIdentifier,
+    // A Dock app is its own owner. Only helpers climb to the app responsible for them: a game Steam launched has Steam
+    // as its responsible process, so climbing would show the game as "Steam".
+    let isDockApp = NSRunningApplication(processIdentifier: process.processID)?.activationPolicy == .regular
+    let ownerProcessID = isDockApp ? process.processID : owningAppProcessID(of: process.processID) ?? process.processID
+    guard let app = NSRunningApplication(processIdentifier: ownerProcessID) else { return nil }
+    // Some games ship without a bundle ID and run an executable buried in their bundle (Ren'Py builds on Steam:
+    // Game.app/Contents/MacOS/lib/darwin-x86_64/Game), so macOS knows neither. Their bundle's path is the key instead,
+    // which also sends their tap to the processes, never to a bundle ID.
+    let bundleURL = app.bundleURL ?? enclosingAppBundle(of: app.executableURL)
+    guard app.activationPolicy != .prohibited,
+          let bundleID = app.bundleIdentifier ?? bundleURL?.path,
           bundleID != Bundle.main.bundleIdentifier,
-          !isAppleBackgroundService(bundleURL: app.bundleURL, policy: app.activationPolicy) else { return nil }
-    return AppIdentity(bundleID: bundleID, name: visibleAppName(app.localizedName, bundleURL: app.bundleURL, bundleID: bundleID),
-                       bundleURL: app.bundleURL)
+          !isAppleBackgroundService(bundleURL: bundleURL, policy: app.activationPolicy) else { return nil }
+    return AppIdentity(bundleID: bundleID, name: visibleAppName(app.localizedName, bundleURL: bundleURL, bundleID: bundleID),
+                       bundleURL: bundleURL)
+}
+
+/// The outermost ".app" folder an executable sits in, or nil if it is not inside one.
+func enclosingAppBundle(of executableURL: URL?) -> URL? {
+    guard let components = executableURL?.pathComponents,
+          let appIndex = components.firstIndex(where: { $0.hasSuffix(".app") }) else { return nil }
+    return URL(fileURLWithPath: NSString.path(withComponents: Array(components[...appIndex])), isDirectory: true)
 }
 
 /// macOS's own helper apps without a Dock icon, such as MediaRemoteUIService on macOS 27, which uses audio and shows as a
