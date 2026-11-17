@@ -7,7 +7,9 @@ import Observation
 @Observable @MainActor
 final class UpdateChecker {
     static let releasesPage = URL(string: "https://github.com/Aratolotl/EarSax")!
-    private static let latestRelease = URL(string: "https://api.github.com/repos/Aratolotl/EarSax/releases/latest")!
+    /// The newest release, previews included: GitHub's `releases/latest` skips pre-releases, and every release is a
+    /// preview until signed builds exist.
+    private static let latestRelease = URL(string: "https://api.github.com/repos/Aratolotl/EarSax/releases?per_page=1")!
 
     enum Status: Equatable {
         case notChecked, checking, upToDate
@@ -56,7 +58,16 @@ final class UpdateChecker {
                 return
             }
             struct Release: Decodable { let tag_name: String; let html_url: URL }
-            guard let release = try? JSONDecoder().decode(Release.self, from: data), release.html_url.scheme == "https" else {
+            guard let releases = try? JSONDecoder().decode([Release].self, from: data) else {
+                status = .failed("GitHub's answer couldn't be read.")
+                earSaxLog.error("Update check: unreadable answer")
+                return
+            }
+            guard let release = releases.first else {
+                status = .failed("No release has been published yet.")
+                return
+            }
+            guard release.html_url.scheme == "https" else {
                 status = .failed("GitHub's answer couldn't be read.")
                 earSaxLog.error("Update check: unreadable answer")
                 return
