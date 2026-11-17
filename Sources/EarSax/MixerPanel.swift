@@ -14,6 +14,7 @@ struct MixerPanel: View {
             InputRow(mixer: mixer)
             Divider()
             AppsSection(mixer: mixer)
+            AlertSoundsRow(mixer: mixer)
             Divider()
             if case .available(let version, let downloadPage) = updates.status {
                 // Shown only when a newer version exists.
@@ -198,6 +199,41 @@ private struct AppsSection: View {
         let entry: AnyTransition = reduceMotion ? .opacity : .opacity.combined(with: .offset(y: -6))
         return .asymmetric(insertion: entry.animation(.easeOut(duration: 0.25)),
                            removal: .opacity.animation(.easeOut(duration: 0.2)))
+    }
+}
+
+/// macOS's alert volume (ruling R30): a row under the apps, shaped like theirs. No tap: EarSax sets macOS's own value.
+/// The alert sound plays when the slider is let go, so the new level can be heard, as in System Settings.
+private struct AlertSoundsRow: View {
+    let mixer: MixerModel
+
+    var body: some View {
+        if let volume = mixer.alertVolume {
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 8) {
+                    Image(systemName: "bell.fill")
+                        .font(.system(size: 15))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 18, height: 18)
+                        .accessibilityHidden(true)
+                    VStack(alignment: .leading, spacing: 0) {
+                        Text("Alert sounds").lineLimit(1)
+                        // macOS can play alerts on a device of their own; EarSax leaves that choice alone (R32), so say it.
+                        if let device = mixer.alertDeviceNameIfElsewhere {
+                            Text("On \(device)").font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                        }
+                    }
+                    Spacer()
+                    Text("\(Int((volume * 100).rounded()))%")
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
+                Slider(value: Binding(get: { Double(volume) }, set: { mixer.setAlertVolume(Float($0)) }),
+                       onEditingChanged: { isDragging in if !isDragging { NSSound.beep() } })
+                    .accessibilityLabel("Alert sounds volume")
+                    .padding(.leading, 26)   // lines up with the app sliders, which start after their mute button
+            }
+        }
     }
 }
 

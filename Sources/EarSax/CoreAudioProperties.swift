@@ -116,3 +116,11 @@ func readableStatus(_ status: OSStatus) -> String {
     let bytes = withUnsafeBytes(of: UInt32(bitPattern: status).bigEndian, Array.init)
     return bytes.allSatisfy { $0 >= 32 && $0 < 127 } ? String(decoding: bytes, as: UTF8.self) : "\(status)"
 }
+
+func readDictionaryProperty(_ property: AudioObjectPropertySelector, of object: AudioObjectID) -> [String: Any]? {
+    var address = propertyAddress(property)
+    var byteCount = UInt32(MemoryLayout<CFDictionary?>.size)
+    var dictionary: Unmanaged<CFDictionary>?
+    guard AudioObjectGetPropertyData(object, &address, 0, nil, &byteCount, &dictionary) == noErr, let dictionary else { return nil }
+    return dictionary.takeRetainedValue() as? [String: Any]
+}
