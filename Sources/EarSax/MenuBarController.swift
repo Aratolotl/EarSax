@@ -46,6 +46,9 @@ final class MenuBarController: NSObject, NSApplicationDelegate, NSPopoverDelegat
         statusItem.button?.target = self
         statusItem.button?.action = #selector(togglePanel)
         statusItem.button?.setAccessibilityLabel("EarSax")
+        // macOS saves the icon's place in the menu bar under this name, so menu-bar organisers that hide icons by position
+        // keep it where the user put it (FineTune #490).
+        statusItem.autosaveName = "EarSax"
         self.statusItem = statusItem
         updateMenuBarIcon()
         keepMenuBarIconInSync()
@@ -61,6 +64,7 @@ final class MenuBarController: NSObject, NSApplicationDelegate, NSPopoverDelegat
         } else if let button = statusItem?.button {
             mixer.refreshApps()
             mixer.refreshOutputDevices()
+            mixer.refreshAlertVolume()
             panel.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
             panel.contentViewController?.view.window?.makeKey()
         }

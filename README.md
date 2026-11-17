@@ -44,14 +44,17 @@ Requires macOS 26 or later on a Mac with Apple silicon.
 ### 🎚 Volume
 - **Per-app volume and mute,** remembered for each app.
 - **Main volume** for the current device, with mute.
+- **Alert sounds:** the volume of macOS's alert sounds, right under your apps.
 - **Untouched apps stay untouched:** an app at 100% plays exactly as it would without EarSax.
 
 ### 🔀 Where sound plays
 - **Play everything on:** pick a device and every app moves there.
+- **No gap when switching:** apps whose volume EarSax changes crossfade to the new device instead of cutting out.
 - **One app elsewhere:** send a single app to another device, for now.
 - **Pins:** pin a device and that app always plays there while it's connected. It follows your main output while the device is away, and goes back when it returns.
 - **Low delay:** EarSax adds about 12 ms (measured on Bluetooth headphones).
 - **Sound input:** with more than one microphone, pick which one the Mac uses from the row under the main volume.
+- **Known limit:** while EarSax changes an app's volume, AirPods may not hand off to an iPhone on their own. Set that app back to 100% to let them.
 
 ### 🎙 Microphone
 - **Bluetooth headphones keep their full sound:** when they connect, macOS also hands them the microphone, which makes everything they play sound muffled while an app listens. EarSax switches back to the microphone you used before. You can still pick the headphones' microphone yourself, and the behavior can be turned off in Settings.
