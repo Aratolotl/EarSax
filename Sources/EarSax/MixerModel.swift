@@ -251,13 +251,15 @@ final class MixerModel {
         }
     }
 
-    /// macOS sends no notice when an app starts or stops playing unless each process is asked for one.
+    /// macOS sends no notice when an app starts or stops playing unless each process is asked for one. The notice is "is
+    /// running": macOS never announces "is running output" itself (measured 2026-11-18, both ways, with a process that starts
+    /// and stops its sound without quitting); listening to that one left a played app silent until the panel opened.
     /// ponytail: listeners are never removed (see whenPropertyChanges); a process that quits takes its own with it.
     private func listenToPlayingFlags(of processes: [ProcessUsingAudio]) {
         let current = Set(processes.map(\.coreAudioID))
         processesWithPlayingListener.formIntersection(current)   // an ID macOS reuses gets a listener again
         for process in current where processesWithPlayingListener.insert(process).inserted {
-            whenPropertyChanges(kAudioProcessPropertyIsRunningOutput, of: process) { [weak self] in
+            whenPropertyChanges(kAudioProcessPropertyIsRunning, of: process) { [weak self] in
                 self?.refreshApps()
             }
         }
