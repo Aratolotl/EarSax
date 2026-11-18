@@ -36,6 +36,9 @@ final class MixerModel {
         inputDevices.first { $0.id == currentInputDeviceID }
     }
 
+    /// Set when EarSax kept the microphone as Bluetooth headphones connected; the panel says so under Sound input.
+    private(set) var keptMicrophone: KeptMicrophone?
+
     /// Keep using the Mac's microphone when Bluetooth headphones connect (R26 to R28, on out of the box).
     var keepsMacMicrophoneWithBluetooth: Bool {
         didSet { preferences.set(keepsMacMicrophoneWithBluetooth, forKey: "keepsMacMicrophoneWithBluetooth") }
@@ -168,6 +171,9 @@ final class MixerModel {
         let knownBefore = Set(inputDevices.map(\.persistentID))
         inputDevices = listInputDevices()
         currentInputDeviceID = systemInputDeviceID()
+        if let keptMicrophone, !keptMicrophone.stillApplies(currentInput: mainInputDevice?.persistentID, inputs: inputDevices) {
+            self.keptMicrophone = nil
+        }
         let now = ContinuousClock.now
         if hasListedInputs {
             for device in inputDevices where device.isBluetooth && !knownBefore.contains(device.persistentID) {
@@ -189,7 +195,12 @@ final class MixerModel {
                                           justConnected: bluetoothInputConnectedAt[current.persistentID] != nil,
                                           inputs: inputDevices) else { return }
         earSaxLog.notice("\(current.name) took the microphone as it connected; switching back to \(keep.name) so it keeps full sound quality")
-        if makeSystemInputDevice(keep.id) { currentInputDeviceID = keep.id; lastListedInputID = keep.id }
+        if makeSystemInputDevice(keep.id) {
+            currentInputDeviceID = keep.id
+            lastListedInputID = keep.id
+            keptMicrophone = KeptMicrophone(microphonePersistentID: keep.persistentID,
+                                            headphonesPersistentID: current.persistentID, headphonesName: current.name)
+        }
     }
 
     func refreshOutputVolume() {
@@ -575,6 +586,7 @@ final class MixerModel {
     func selectInputDevice(_ device: AudioDevice) {
         earSaxLog.notice("Picked \(device.name) under Sound input")
         bluetoothInputConnectedAt[device.persistentID] = nil   // the user's pick is never undone
+        keptMicrophone = nil   // they chose; the note has done its job
         if !makeSystemInputDevice(device.id) { refreshInputDevices() }
     }
 

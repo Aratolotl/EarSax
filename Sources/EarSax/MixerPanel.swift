@@ -134,30 +134,45 @@ private struct OutputSection: View {
 // MARK: - Input
 
 /// The Mac's sound input, a dropdown like the output's. Picker only, no level slider (ruling R24). Shown only with two or
-/// more microphones (R27): it's there to see and override what EarSax chose when Bluetooth headphones connect.
+/// more microphones (R27): it's there to see and override what EarSax chose when Bluetooth headphones connect. After EarSax
+/// kept the microphone, a quiet line under it says so, until the input changes or the headphones leave.
 private struct InputRow: View {
     let mixer: MixerModel
 
     var body: some View {
         if mixer.devicesForSoundInput.count >= 2 {
-            Menu {
-                Section("Sound input") {
-                    ForEach(mixer.devicesForSoundInput) { device in
-                        Toggle(isOn: Binding(get: { device.id == mixer.currentInputDeviceID },
-                                             set: { _ in mixer.selectInputDevice(device) })) {
-                            Label(device.name, systemImage: device.symbolName)
-                        }
+            VStack(alignment: .leading, spacing: 2) {
+                inputMenu
+                if let kept = mixer.keptMicrophone {
+                    Text("Kept when \(kept.headphonesName) connected")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .padding(.leading, 22)   // under the device name, past the microphone icon
+                        .help("Bluetooth headphones sound muffled while their microphone is in use, so EarSax kept this one. To use the headphones' microphone, pick it in the menu above.")
+                }
+            }
+        }
+    }
+
+    private var inputMenu: some View {
+        Menu {
+            Section("Sound input") {
+                ForEach(mixer.devicesForSoundInput) { device in
+                    Toggle(isOn: Binding(get: { device.id == mixer.currentInputDeviceID },
+                                         set: { _ in mixer.selectInputDevice(device) })) {
+                        Label(device.name, systemImage: device.symbolName)
                     }
                 }
-            } label: {
-                // Always the microphone icon, so the row reads as the input even when the device is a headset.
-                Label(mixer.mainInputDevice?.name ?? "No input device", systemImage: mixer.mainInputDevice == nil ? "mic.slash" : "mic")
             }
-            .menuStyle(.borderlessButton)
-            .fixedSize()
-            .accessibilityLabel("Input device")
-            .accessibilityValue(mixer.mainInputDevice?.name ?? "None")
+        } label: {
+            // Always the microphone icon, so the row reads as the input even when the device is a headset.
+            Label(mixer.mainInputDevice?.name ?? "No input device", systemImage: mixer.mainInputDevice == nil ? "mic.slash" : "mic")
         }
+        .menuStyle(.borderlessButton)
+        .fixedSize()
+        .accessibilityLabel("Input device")
+        .accessibilityValue(mixer.mainInputDevice?.name ?? "None")
     }
 }
 
