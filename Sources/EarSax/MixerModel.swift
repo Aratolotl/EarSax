@@ -240,6 +240,15 @@ final class MixerModel {
         // A tap's private device runs only while its app plays or played in the last 5 seconds; the rest of the time
         // nothing records, so macOS shows no recording indicator.
         tapController.runAudio(onlyFor: Set(visibleApps.map(\.id)))
+        // An app inside its grace needs one more look once the grace ends, whatever caused this refresh (a helper that
+        // quit sends no "stopped playing" notice; code review of the calls branch, finding 2).
+        if refreshAfterGrace == nil, visibleApps.contains(where: { !$0.isPlayingSound }) {
+            refreshAfterGrace = Task { [weak self] in
+                try? await Task.sleep(for: Self.stillShownAfterStopping + .milliseconds(100))
+                self?.refreshAfterGrace = nil
+                self?.refreshApps()
+            }
+        }
     }
 
     /// macOS sends no notice when an app starts or stops playing unless each process is asked for one.
@@ -249,14 +258,7 @@ final class MixerModel {
         processesWithPlayingListener.formIntersection(current)   // an ID macOS reuses gets a listener again
         for process in current where processesWithPlayingListener.insert(process).inserted {
             whenPropertyChanges(kAudioProcessPropertyIsRunningOutput, of: process) { [weak self] in
-                guard let self else { return }
-                refreshApps()
-                refreshAfterGrace?.cancel()
-                refreshAfterGrace = Task { [weak self] in
-                    try? await Task.sleep(for: Self.stillShownAfterStopping + .milliseconds(100))
-                    guard !Task.isCancelled else { return }
-                    self?.refreshApps()
-                }
+                self?.refreshApps()
             }
         }
     }
@@ -404,6 +406,14 @@ final class MixerModel {
                 // A late failure for an app already back at 100% isn't a problem worth showing (review finding 3).
                 guard let self, problem == nil || self.needsTap(appID) else { return }
                 self.tapProblemByApp[appID] = problem
+                // A failed tap is retried after 10 s, but only by a refresh; one might not come while the app plays on
+                // (code review of the calls branch, finding 3).
+                if problem != nil {
+                    Task { [weak self] in
+                        try? await Task.sleep(for: .seconds(10.5))
+                        self?.refreshApps()
+                    }
+                }
             }
         }
     }

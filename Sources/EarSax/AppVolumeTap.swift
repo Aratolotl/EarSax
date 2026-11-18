@@ -573,10 +573,15 @@ final class TapController: @unchecked Sendable {
         tapQueue.async { [self] in
             for (appID, active) in tapsByApp.sorted(by: { $0.key < $1.key }) {
                 if !playingAppIDs.contains(appID) {
-                    guard active.tap.isAudioRunning else { continue }
+                    // Never stopped while macOS says the app plays: the list can be a moment old, and a missed "started
+                    // playing" notice would leave the app silenced (code review of the calls branch, finding 1).
+                    guard active.tap.isAudioRunning, !isPlayingNow(active.target) else { continue }
                     active.tap.pauseAudio()
                     earSaxLog.notice("\(appID) is silent; its tap's audio stopped")
-                } else if !active.tap.isAudioRunning, isPlayingNow(active.target) {   // checked again: starting waits for sound
+                } else if !active.tap.isAudioRunning, isPlayingNow(active.target) {
+                    // Checked again because starting waits for sound. ponytail: an app that stops in the microseconds
+                    // between this check and the start holds the tap queue until it plays again (code review, finding 4,
+                    // kept: dropping tap auto-start would change every tap's start and needs a listening test first).
                     let status = active.tap.startAudio()
                     if status == noErr {
                         earSaxLog.notice("\(appID) plays; its tap's audio started")
