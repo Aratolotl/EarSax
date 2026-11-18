@@ -8,7 +8,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/Aratolotl/EarSax/releases/latest"><img src="https://img.shields.io/github/v/release/Aratolotl/EarSax?style=for-the-badge&label=Latest&labelColor=1c1c1e&color=3a3a3c" alt="Latest release"></a>
+  <a href="https://github.com/Aratolotl/EarSax/releases"><img src="https://img.shields.io/github/v/release/Aratolotl/EarSax?include_prereleases&style=for-the-badge&label=Latest&labelColor=1c1c1e&color=3a3a3c" alt="Latest release"></a>
   <img src="https://img.shields.io/badge/macOS-26%2B-3a3a3c?style=for-the-badge&labelColor=1c1c1e&logo=apple&logoColor=white" alt="macOS 26 or later">
   <img src="https://img.shields.io/badge/Apple_silicon-3a3a3c?style=for-the-badge&labelColor=1c1c1e" alt="Apple silicon">
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-3a3a3c?style=for-the-badge&labelColor=1c1c1e" alt="License: MIT"></a>
