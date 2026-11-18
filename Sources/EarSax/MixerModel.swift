@@ -79,6 +79,10 @@ final class MixerModel {
     @ObservationIgnored private var pendingTapRemovalByApp: [String: Task<Void, Never>] = [:]
     @ObservationIgnored private var lastPlayingTimeByApp: [String: ContinuousClock.Instant] = [:]
     private static let stillShownAfterStopping: Duration = .seconds(5)
+    /// Processes whose "playing" flag EarSax listens to, so a tap's audio starts the moment its app plays again.
+    @ObservationIgnored private var processesWithPlayingListener: Set<AudioObjectID> = []
+    /// One refresh just after the 5-second grace, so an app that stopped leaves the list and its tap's audio stops.
+    @ObservationIgnored private var refreshAfterGrace: Task<Void, Never>?
     @ObservationIgnored private var tapTargetByApp: [String: TapTarget] = [:]
     @ObservationIgnored private var watchedOutputDeviceID = AudioDeviceID(kAudioObjectUnknown)
     /// Devices that already have listeners, so switching back and forth doesn't stack duplicates (review finding 1).
@@ -207,7 +211,9 @@ final class MixerModel {
 
     func refreshApps() {
         refreshPermission()
-        let allApps = groupProcessesIntoApps(listProcessesUsingAudio(), identifyApp: identifyOwningApp)
+        let processes = listProcessesUsingAudio()
+        listenToPlayingFlags(of: processes)
+        let allApps = groupProcessesIntoApps(processes, identifyApp: identifyOwningApp)
         let now = ContinuousClock.now
         for app in allApps where app.isPlayingSound { lastPlayingTimeByApp[app.id] = now }
         visibleApps = allApps.filter { app in
@@ -220,6 +226,28 @@ final class MixerModel {
         for app in allApps { applySetting(to: app) }
         removeTapsOfAppsThatQuit(stillRunning: Set(allApps.map(\.id)))
         moveTapsToTheirOutputs()
+        // A tap's private device runs only while its app plays or played in the last 5 seconds; the rest of the time
+        // nothing records, so macOS shows no recording indicator.
+        tapController.runAudio(onlyFor: Set(visibleApps.map(\.id)))
+    }
+
+    /// macOS sends no notice when an app starts or stops playing unless each process is asked for one.
+    /// ponytail: listeners are never removed (see whenPropertyChanges); a process that quits takes its own with it.
+    private func listenToPlayingFlags(of processes: [ProcessUsingAudio]) {
+        let current = Set(processes.map(\.coreAudioID))
+        processesWithPlayingListener.formIntersection(current)   // an ID macOS reuses gets a listener again
+        for process in current where processesWithPlayingListener.insert(process).inserted {
+            whenPropertyChanges(kAudioProcessPropertyIsRunningOutput, of: process) { [weak self] in
+                guard let self else { return }
+                refreshApps()
+                refreshAfterGrace?.cancel()
+                refreshAfterGrace = Task { [weak self] in
+                    try? await Task.sleep(for: Self.stillShownAfterStopping + .milliseconds(100))
+                    guard !Task.isCancelled else { return }
+                    self?.refreshApps()
+                }
+            }
+        }
     }
 
     /// A process tap points at specific processes, so once its app has quit it holds nothing but a private device.
