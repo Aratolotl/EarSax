@@ -406,3 +406,15 @@ private func runOneAudioCycle(_ copier: TapAudioCopier, frameCount: Int) -> [Flo
     #expect(!isAppleBackgroundService(bundleURL: service, policy: .regular))
     #expect(!isAppleBackgroundService(bundleURL: URL(fileURLWithPath: "/Applications/Menu Player.app"), policy: .accessory))
 }
+
+@Test func theKeptMicrophoneNoteLastsOnlyWhileItIsTrue() {
+    let builtIn = AudioDevice(id: 1, persistentID: "BuiltInMicrophoneDevice", name: "Built-in", symbolName: "mic", isBuiltIn: true)
+    let earbuds = AudioDevice(id: 2, persistentID: "aa-bb:input", name: "Earbuds", symbolName: "earbuds", isBluetooth: true)
+    let usb = AudioDevice(id: 3, persistentID: "usb-mic", name: "USB", symbolName: "mic")
+    let note = KeptMicrophone(microphonePersistentID: builtIn.persistentID, headphonesPersistentID: earbuds.persistentID,
+                              headphonesName: earbuds.name)
+    #expect(note.stillApplies(currentInput: builtIn.persistentID, inputs: [builtIn, earbuds, usb]))
+    #expect(!note.stillApplies(currentInput: usb.persistentID, inputs: [builtIn, earbuds, usb]))       // another input picked
+    #expect(!note.stillApplies(currentInput: earbuds.persistentID, inputs: [builtIn, earbuds, usb]))   // the earbuds picked
+    #expect(!note.stillApplies(currentInput: builtIn.persistentID, inputs: [builtIn, usb]))            // the earbuds left
+}

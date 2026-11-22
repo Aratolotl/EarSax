@@ -248,9 +248,14 @@ final class SpeakerPath {
     let copier: TapAudioCopier
     private var privateDeviceID = AudioObjectID(kAudioObjectUnknown)
     private var audioCallbackID: AudioDeviceIOProcID?
+    /// While this runs, macOS counts EarSax as recording (its privacy indicator) and the speakers stay awake. So it runs
+    /// only while the app plays.
+    private(set) var isAudioRunning = false
 
+    /// `startsAudio: false` builds it stopped, for an app that is silent now: with tap auto-start, starting waits for the
+    /// app's first sound, which blocked the tap queue (20 s in a listening-test log, with a paused browser).
     init(appID: String, tapUUID: String, realtimeState: RealtimeVolumeState, outputDevicePersistentID: String,
-         fadedIn: Bool) throws {
+         fadedIn: Bool, startsAudio: Bool) throws {
         self.outputDevicePersistentID = outputDevicePersistentID
         copier = TapAudioCopier(volume: realtimeState, fadedIn: fadedIn)
         do {
@@ -269,8 +274,10 @@ final class SpeakerPath {
             status = AudioDeviceCreateIOProcIDWithBlock(&audioCallbackID, privateDeviceID, nil, Self.makeRealtimeAudioCallback(copier))
             guard status == noErr else { throw TapSetupError(failedStep: "Registering the audio callback", status: status) }
 
-            status = AudioDeviceStart(privateDeviceID, audioCallbackID)
-            guard status == noErr else { throw TapSetupError(failedStep: "Starting the audio", status: status) }
+            if startsAudio {
+                status = startAudio()
+                guard status == noErr else { throw TapSetupError(failedStep: "Starting the audio", status: status) }
+            }
         } catch {
             stop()
             throw error
@@ -357,9 +364,19 @@ final class SpeakerPath {
         readProperty(kAudioDevicePropertyNominalSampleRate, of: privateDeviceID, orDefault: Float64(0))
     }
 
+    /// Call only while the app plays: with tap auto-start this waits for the app's sound.
+    func startAudio() -> OSStatus {
+        guard !isAudioRunning else { return noErr }
+        guard privateDeviceID != kAudioObjectUnknown, let audioCallbackID else { return kAudioHardwareNotRunningError }
+        let status = AudioDeviceStart(privateDeviceID, audioCallbackID)
+        isAudioRunning = status == noErr
+        return status
+    }
+
     /// Stops this path's sound; the tap keeps the app silenced.
     func pauseAudio() {
         if privateDeviceID != kAudioObjectUnknown, let audioCallbackID { AudioDeviceStop(privateDeviceID, audioCallbackID) }
+        isAudioRunning = false
     }
 
     func stop() {
@@ -370,6 +387,7 @@ final class SpeakerPath {
             }
             AudioHardwareDestroyAggregateDevice(privateDeviceID)
         }
+        isAudioRunning = false
         audioCallbackID = nil
         privateDeviceID = AudioObjectID(kAudioObjectUnknown)
     }
@@ -389,9 +407,10 @@ final class AppVolumeTap {
     /// The speakers or headphones this tap plays to.
     var outputDevicePersistentID: String { speakers?.outputDevicePersistentID ?? "" }
 
-    /// `fadedIn: false` starts it silent, for the new side of a crossfade.
+    /// `fadedIn: false` starts it silent, for the new side of a crossfade. `startsAudio: false` builds it stopped (the app
+    /// is silent); the app stays silenced by the tap until `startAudio`.
     init(appID: String, target: TapTarget, realtimeState: RealtimeVolumeState, outputDevicePersistentID: String,
-         fadedIn: Bool = true) throws {
+         fadedIn: Bool = true, startsAudio: Bool = true) throws {
         self.appID = appID
         self.realtimeState = realtimeState
         switch target {
@@ -414,7 +433,8 @@ final class AppVolumeTap {
         guard status == noErr else { throw TapSetupError(failedStep: "Creating the audio tap", status: status) }
         do {
             speakers = try SpeakerPath(appID: appID, tapUUID: tapDescription.uuid.uuidString, realtimeState: realtimeState,
-                                       outputDevicePersistentID: outputDevicePersistentID, fadedIn: fadedIn)
+                                       outputDevicePersistentID: outputDevicePersistentID, fadedIn: fadedIn,
+                                       startsAudio: startsAudio)
         } catch {
             stop()
             throw error
@@ -467,7 +487,12 @@ final class AppVolumeTap {
         speakers.copier.startFade(to: 0, overFrames: seconds(duration) * speakers.sampleRate)
     }
 
-    /// Stops this tap's sound but keeps the tap, so its app stays silenced. Used just before a replacement on the same device.
+    var isAudioRunning: Bool { speakers?.isAudioRunning ?? false }
+
+    func startAudio() -> OSStatus { speakers?.startAudio() ?? kAudioHardwareNotRunningError }
+
+    /// Stops this tap's sound but keeps the tap, so its app stays silenced: before a replacement on the same device, and
+    /// while the app is silent.
     func pauseAudio() {
         speakers?.pauseAudio()
     }
@@ -498,11 +523,15 @@ final class TapController: @unchecked Sendable {
     }
 
     /// A tap that failed, so the same attempt isn't retried every second (permission refused, device gone).
-    /// A different target or output device, or removing the tap, clears it (review finding 3).
+    /// A different target or output device, or removing the tap, clears it (review finding 3). The same attempt is tried
+    /// again after `retryFailedTapAfter`: a rebuild that failed while Bluetooth headphones changed to call quality left the
+    /// app untapped, at full volume, until the next output switch (call test pass, found by reading).
     private struct FailedAttempt: Equatable {
         let target: TapTarget
         let outputDevicePersistentID: String
     }
+    private static let retryFailedTapAfter: Duration = .seconds(10)
+    private var failedAtByApp: [String: ContinuousClock.Instant] = [:]
 
     private let tapQueue = DispatchQueue(label: "app.earsax.taps", qos: .userInitiated)
     private var tapsByApp: [String: ActiveTap] = [:]
@@ -528,11 +557,42 @@ final class TapController: @unchecked Sendable {
                            outputDevicePersistentID: outputDevicePersistentID, reportProblem: reportProblem,
                            reason: "its processes changed")
                 return
-            } else if failedAttemptByApp[appID] == FailedAttempt(target: target, outputDevicePersistentID: outputDevicePersistentID) {
+            } else if failedAttemptByApp[appID] == FailedAttempt(target: target, outputDevicePersistentID: outputDevicePersistentID),
+                      let failedAt = failedAtByApp[appID], ContinuousClock.now - failedAt < Self.retryFailedTapAfter {
                 return
             }
             createTap(appID: appID, target: target, realtimeState: realtimeState,
                       outputDevicePersistentID: outputDevicePersistentID, reportProblem: reportProblem)
+        }
+    }
+
+    /// Runs the private devices of these apps and stops the others' (their taps stay, so those apps stay silenced). A running
+    /// private device is what macOS shows as recording, and it kept the indicator on all day with every changed app paused
+    /// (seen 2026-11-18: EarSax "capturing" with a browser and a music app tapped and silent).
+    func runAudio(onlyFor playingAppIDs: Set<String>) {
+        tapQueue.async { [self] in
+            for (appID, active) in tapsByApp.sorted(by: { $0.key < $1.key }) {
+                if !playingAppIDs.contains(appID) {
+                    // Never stopped while macOS says the app plays: the list can be a moment old, and a missed "started
+                    // playing" notice would leave the app silenced (code review of the calls branch, finding 1).
+                    guard active.tap.isAudioRunning, !isPlayingNow(active.target) else { continue }
+                    active.tap.pauseAudio()
+                    earSaxLog.notice("\(appID) is silent; its tap's audio stopped")
+                } else if !active.tap.isAudioRunning, isPlayingNow(active.target) {
+                    // Checked again because starting waits for sound. ponytail: an app that stops in the microseconds
+                    // between this check and the start holds the tap queue until it plays again (code review, finding 4,
+                    // kept: dropping tap auto-start would change every tap's start and needs a listening test first).
+                    let status = active.tap.startAudio()
+                    if status == noErr {
+                        earSaxLog.notice("\(appID) plays; its tap's audio started")
+                    } else {
+                        // Never leave the app silenced by a tap that doesn't play.
+                        replaceTap(appID: appID, oldTap: active.tap, target: active.target, realtimeState: active.realtimeState,
+                                   outputDevicePersistentID: active.tap.outputDevicePersistentID,
+                                   reportProblem: active.reportProblem, reason: "its audio didn't restart (\(readableStatus(status)))")
+                    }
+                }
+            }
         }
     }
 
@@ -799,15 +859,17 @@ final class TapController: @unchecked Sendable {
                            outputDevicePersistentID: String, reportProblem: @escaping ProblemReport, reportsFailure: Bool = true) {
         let startedBuildingAt = ContinuousClock.now
         do {
+            let startsAudio = isPlayingNow(target)
             let tap = try AppVolumeTap(appID: appID, target: target, realtimeState: realtimeState,
-                                       outputDevicePersistentID: outputDevicePersistentID)
+                                       outputDevicePersistentID: outputDevicePersistentID, startsAudio: startsAudio)
             tapsByApp[appID] = ActiveTap(tap: tap, target: target, realtimeState: realtimeState, reportProblem: reportProblem,
                                          builtAt: startedBuildingAt)
             failedAttemptByApp[appID] = nil
-            earSaxLog.notice("Tap started for \(appID) on \(outputDevicePersistentID) (\(String(describing: target)))")
+            earSaxLog.notice("Tap started for \(appID) on \(outputDevicePersistentID) (\(String(describing: target)))\(startsAudio ? "" : ", waiting for its sound")")
             reportProblem(nil)
         } catch {
             failedAttemptByApp[appID] = FailedAttempt(target: target, outputDevicePersistentID: outputDevicePersistentID)
+            failedAtByApp[appID] = .now
             earSaxLog.error("Tap failed for \(appID): \(String(describing: error))")
             if reportsFailure { reportProblem("\(error)") }
         }
@@ -826,6 +888,15 @@ private func milliseconds(since start: ContinuousClock.Instant) -> Int64 {
 private func isBluetoothDevice(_ persistentID: String) -> Bool {
     let transport = readProperty(kAudioDevicePropertyTransportType, of: deviceID(forPersistentID: persistentID), orDefault: UInt32(0))
     return transport == kAudioDeviceTransportTypeBluetooth || transport == kAudioDeviceTransportTypeBluetoothLE
+}
+
+/// Whether any process the tap covers plays now (macOS's own flag, which stays on while an app holds its sound open).
+private func isPlayingNow(_ target: TapTarget) -> Bool {
+    let processes = listProcessesUsingAudio()
+    switch target {
+    case .processes(let ids): return processes.contains { ids.contains($0.coreAudioID) && $0.isPlayingSound }
+    case .bundleIDs(let bundleIDs): return processes.contains { bundleIDs.contains($0.bundleID) && $0.isPlayingSound }
+    }
 }
 
 private func hasOutputStreams(_ persistentID: String) -> Bool {

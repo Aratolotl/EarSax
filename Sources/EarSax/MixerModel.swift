@@ -36,6 +36,9 @@ final class MixerModel {
         inputDevices.first { $0.id == currentInputDeviceID }
     }
 
+    /// Set when EarSax kept the microphone as Bluetooth headphones connected; the panel says so under Sound input.
+    private(set) var keptMicrophone: KeptMicrophone?
+
     /// Keep using the Mac's microphone when Bluetooth headphones connect (R26 to R28, on out of the box).
     var keepsMacMicrophoneWithBluetooth: Bool {
         didSet { preferences.set(keepsMacMicrophoneWithBluetooth, forKey: "keepsMacMicrophoneWithBluetooth") }
@@ -79,6 +82,10 @@ final class MixerModel {
     @ObservationIgnored private var pendingTapRemovalByApp: [String: Task<Void, Never>] = [:]
     @ObservationIgnored private var lastPlayingTimeByApp: [String: ContinuousClock.Instant] = [:]
     private static let stillShownAfterStopping: Duration = .seconds(5)
+    /// Processes whose "playing" flag EarSax listens to, so a tap's audio starts the moment its app plays again.
+    @ObservationIgnored private var processesWithPlayingListener: Set<AudioObjectID> = []
+    /// One refresh just after the 5-second grace, so an app that stopped leaves the list and its tap's audio stops.
+    @ObservationIgnored private var refreshAfterGrace: Task<Void, Never>?
     @ObservationIgnored private var tapTargetByApp: [String: TapTarget] = [:]
     @ObservationIgnored private var watchedOutputDeviceID = AudioDeviceID(kAudioObjectUnknown)
     /// Devices that already have listeners, so switching back and forth doesn't stack duplicates (review finding 1).
@@ -164,6 +171,9 @@ final class MixerModel {
         let knownBefore = Set(inputDevices.map(\.persistentID))
         inputDevices = listInputDevices()
         currentInputDeviceID = systemInputDeviceID()
+        if let keptMicrophone, !keptMicrophone.stillApplies(currentInput: mainInputDevice?.persistentID, inputs: inputDevices) {
+            self.keptMicrophone = nil
+        }
         let now = ContinuousClock.now
         if hasListedInputs {
             for device in inputDevices where device.isBluetooth && !knownBefore.contains(device.persistentID) {
@@ -185,7 +195,12 @@ final class MixerModel {
                                           justConnected: bluetoothInputConnectedAt[current.persistentID] != nil,
                                           inputs: inputDevices) else { return }
         earSaxLog.notice("\(current.name) took the microphone as it connected; switching back to \(keep.name) so it keeps full sound quality")
-        if makeSystemInputDevice(keep.id) { currentInputDeviceID = keep.id; lastListedInputID = keep.id }
+        if makeSystemInputDevice(keep.id) {
+            currentInputDeviceID = keep.id
+            lastListedInputID = keep.id
+            keptMicrophone = KeptMicrophone(microphonePersistentID: keep.persistentID,
+                                            headphonesPersistentID: current.persistentID, headphonesName: current.name)
+        }
     }
 
     func refreshOutputVolume() {
@@ -207,7 +222,9 @@ final class MixerModel {
 
     func refreshApps() {
         refreshPermission()
-        let allApps = groupProcessesIntoApps(listProcessesUsingAudio(), identifyApp: identifyOwningApp)
+        let processes = listProcessesUsingAudio()
+        listenToPlayingFlags(of: processes)
+        let allApps = groupProcessesIntoApps(processes, identifyApp: identifyOwningApp)
         let now = ContinuousClock.now
         for app in allApps where app.isPlayingSound { lastPlayingTimeByApp[app.id] = now }
         visibleApps = allApps.filter { app in
@@ -220,6 +237,32 @@ final class MixerModel {
         for app in allApps { applySetting(to: app) }
         removeTapsOfAppsThatQuit(stillRunning: Set(allApps.map(\.id)))
         moveTapsToTheirOutputs()
+        // A tap's private device runs only while its app plays or played in the last 5 seconds; the rest of the time
+        // nothing records, so macOS shows no recording indicator.
+        tapController.runAudio(onlyFor: Set(visibleApps.map(\.id)))
+        // An app inside its grace needs one more look once the grace ends, whatever caused this refresh (a helper that
+        // quit sends no "stopped playing" notice; code review of the calls branch, finding 2).
+        if refreshAfterGrace == nil, visibleApps.contains(where: { !$0.isPlayingSound }) {
+            refreshAfterGrace = Task { [weak self] in
+                try? await Task.sleep(for: Self.stillShownAfterStopping + .milliseconds(100))
+                self?.refreshAfterGrace = nil
+                self?.refreshApps()
+            }
+        }
+    }
+
+    /// macOS sends no notice when an app starts or stops playing unless each process is asked for one. The notice is "is
+    /// running": macOS never announces "is running output" itself (measured 2026-11-18, both ways, with a process that starts
+    /// and stops its sound without quitting); listening to that one left a played app silent until the panel opened.
+    /// ponytail: listeners are never removed (see whenPropertyChanges); a process that quits takes its own with it.
+    private func listenToPlayingFlags(of processes: [ProcessUsingAudio]) {
+        let current = Set(processes.map(\.coreAudioID))
+        processesWithPlayingListener.formIntersection(current)   // an ID macOS reuses gets a listener again
+        for process in current where processesWithPlayingListener.insert(process).inserted {
+            whenPropertyChanges(kAudioProcessPropertyIsRunning, of: process) { [weak self] in
+                self?.refreshApps()
+            }
+        }
     }
 
     /// A process tap points at specific processes, so once its app has quit it holds nothing but a private device.
@@ -365,6 +408,14 @@ final class MixerModel {
                 // A late failure for an app already back at 100% isn't a problem worth showing (review finding 3).
                 guard let self, problem == nil || self.needsTap(appID) else { return }
                 self.tapProblemByApp[appID] = problem
+                // A failed tap is retried after 10 s, but only by a refresh; one might not come while the app plays on
+                // (code review of the calls branch, finding 3).
+                if problem != nil {
+                    Task { [weak self] in
+                        try? await Task.sleep(for: .seconds(10.5))
+                        self?.refreshApps()
+                    }
+                }
             }
         }
     }
@@ -547,6 +598,7 @@ final class MixerModel {
     func selectInputDevice(_ device: AudioDevice) {
         earSaxLog.notice("Picked \(device.name) under Sound input")
         bluetoothInputConnectedAt[device.persistentID] = nil   // the user's pick is never undone
+        keptMicrophone = nil   // they chose; the note has done its job
         if !makeSystemInputDevice(device.id) { refreshInputDevices() }
     }
 

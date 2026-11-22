@@ -28,6 +28,20 @@ func microphoneToKeep(lastNonBluetoothInput: String?, current: AudioDevice?, jus
     return inputs.first(where: \.isBuiltIn)   // nil when the headphones are the only microphone: they stay
 }
 
+/// The note under Sound input after EarSax kept the microphone, so the switch back is never silent (FineTune users
+/// complained that its locked input reverted their changes without a word, FineTune #459 and #460).
+struct KeptMicrophone: Equatable {
+    let microphonePersistentID: String
+    let headphonesPersistentID: String
+    let headphonesName: String
+
+    /// Shown while the kept microphone is the input and the headphones are connected. Any other input, picked in EarSax or
+    /// anywhere else, ends it.
+    func stillApplies(currentInput: String?, inputs: [AudioDevice]) -> Bool {
+        currentInput == microphonePersistentID && inputs.contains { $0.persistentID == headphonesPersistentID }
+    }
+}
+
 func listOutputDevices() -> [AudioDevice] {
     listDevices(scope: kAudioObjectPropertyScopeOutput) { deviceID, firstStream, transportType in
         outputSymbolName(transportType: transportType,
